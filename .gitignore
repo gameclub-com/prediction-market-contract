@@ -1,0 +1,56 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+build/
+*.tsbuildinfo
+.next/
+
+# Hardhat
+artifacts/
+cache/
+typechain-types/
+
+# Environment
+.env
+.env.local
+.env.*.local
+apps/web/.env.public
+apps/web/.env.stage
+apps/web/.env.prod
+
+# Cloudflare Tunnel credentials
+infra/tunnel/cloudflared/*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+*.Zone.Identifier
+
+# Coverage
+coverage/
+.nyc_output/
+
+# Logs
+*.log
+logs/
+
+# GitHub Actions (PAT lacks workflow scope — push manually or update PAT)
+.github/workflows/
+
+# Misc
+*.pid
+*.seed
+
+# Capture script
+scripts/auth-state.json
+scripts/captures/
+
+/.claude/
