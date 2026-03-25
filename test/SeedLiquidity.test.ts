@@ -1,6 +1,6 @@
 import { loadFixture } from "@nomicfoundation/hardhat-network-helpers";
 import { expect } from "chai";
-import { ethers } from "hardhat";
+import { ethers, upgrades } from "hardhat";
 import type {
   ExchangeCLOB,
   ConditionalTokens,
@@ -37,19 +37,20 @@ async function seedFixture() {
   const usdt = await MockUSDT.deploy();
 
   const ConditionalTokens = await ethers.getContractFactory("ConditionalTokens");
-  const ct = await ConditionalTokens.deploy(await usdt.getAddress(), treasury.address);
+  const ct = await upgrades.deployProxy(ConditionalTokens, [await usdt.getAddress(), treasury.address, deployer.address], {
+    kind: 'uups', initializer: 'initialize',
+  });
 
   const MarketRegistry = await ethers.getContractFactory("MarketRegistry");
-  const registry = await MarketRegistry.deploy(await ct.getAddress());
+  const registry = await upgrades.deployProxy(MarketRegistry, [await ct.getAddress()], {
+    kind: 'uups', initializer: 'initialize',
+  });
 
   const ExchangeCLOB = await ethers.getContractFactory("ExchangeCLOB");
-  const exchange = await ExchangeCLOB.deploy(
-    await usdt.getAddress(),
-    await ct.getAddress(),
-    await registry.getAddress(),
-    feeCollector.address,
-    treasury.address
-  );
+  const exchange = await upgrades.deployProxy(ExchangeCLOB, [
+    await usdt.getAddress(), await ct.getAddress(), await registry.getAddress(),
+    feeCollector.address, treasury.address
+  ], { kind: 'uups', initializer: 'initialize' });
 
   // Grant roles
   await exchange.grantRole(RELAYER_ROLE, relayer.address);
@@ -74,7 +75,7 @@ async function seedFixture() {
     profileHash,
     tags: ["crypto"],
     cutoff: now + 86400 * 7 - 3600,
-    outcomeSlotCount: 2,
+    outcomeSlotCount: 2, collateralPerSet: 0,
   });
 
   await registry.connect(marketAdmin).createMarket({
@@ -83,7 +84,7 @@ async function seedFixture() {
     profileHash,
     tags: ["crypto"],
     cutoff: now + 86400 * 7 - 3600,
-    outcomeSlotCount: 2,
+    outcomeSlotCount: 2, collateralPerSet: 0,
   });
 
   const market1 = await registry.getMarket(1);

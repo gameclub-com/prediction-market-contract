@@ -1,6 +1,6 @@
 import { loadFixture, time } from "@nomicfoundation/hardhat-network-helpers";
 import { expect } from "chai";
-import { ethers } from "hardhat";
+import { ethers, upgrades } from "hardhat";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -22,19 +22,20 @@ async function proxyFixture() {
   const usdt = await MockUSDT.deploy();
 
   const CT = await ethers.getContractFactory("ConditionalTokens");
-  const ct = await CT.deploy(await usdt.getAddress(), treasury.address);
+  const ct = await upgrades.deployProxy(CT, [await usdt.getAddress(), treasury.address, deployer.address], {
+    kind: 'uups', initializer: 'initialize',
+  });
 
   const MR = await ethers.getContractFactory("MarketRegistry");
-  const registry = await MR.deploy(await ct.getAddress());
+  const registry = await upgrades.deployProxy(MR, [await ct.getAddress()], {
+    kind: 'uups', initializer: 'initialize',
+  });
 
   const Exchange = await ethers.getContractFactory("ExchangeCLOB");
-  const exchange = await Exchange.deploy(
-    await usdt.getAddress(),
-    await ct.getAddress(),
-    await registry.getAddress(),
-    feeCollector.address,
-    treasury.address,
-  );
+  const exchange = await upgrades.deployProxy(Exchange, [
+    await usdt.getAddress(), await ct.getAddress(), await registry.getAddress(),
+    feeCollector.address, treasury.address
+  ], { kind: 'uups', initializer: 'initialize' });
 
   await exchange.grantRole(RELAYER_ROLE, relayer.address);
   await registry.grantRole(MARKET_ADMIN_ROLE, marketAdmin.address);
@@ -383,6 +384,28 @@ describe("ProxyWallet", function () {
       expect(bal).to.equal(ethers.parseEther("1"));
     });
   });
+
+  // ── Audit v2 M-9: Zero-owner check ──
+  describe("Audit v2 M-9. initialize with zero owner", function () {
+    it("initialize with zero owner reverts", async function () {
+      const { factory } = await loadFixture(proxyFixture);
+
+      await expect(
+        factory.createProxy(ethers.ZeroAddress, ethers.ZeroHash),
+      ).to.be.revertedWithCustomError(factory, "ZeroAddress");
+    });
+  });
+
+  // ── Audit v2 L-5: Implementation contract locked ──
+  describe("Audit v2 L-5. Implementation contract cannot be re-initialized", function () {
+    it("implementation contract cannot be initialized", async function () {
+      const { pwImpl, user } = await loadFixture(proxyFixture);
+
+      await expect(
+        pwImpl.initialize(user.address, "0x"),
+      ).to.be.revertedWithCustomError(pwImpl, "AlreadyInitialized");
+    });
+  });
 });
 
 // ===========================================================================
@@ -405,6 +428,16 @@ describe("SafeProxyFactory", function () {
 
       await expect(
         SPF.deploy(ethers.ZeroAddress, ethers.ZeroAddress, await usdt.getAddress(), await ct.getAddress()),
+      ).to.be.revertedWithCustomError(SPF, "ZeroAddress");
+    });
+
+    // Audit v2 L-1: Zero-address checks for usdt and conditionalTokens
+    it("reverts with zero usdt address", async function () {
+      const { pwImpl, exchange } = await loadFixture(proxyFixture);
+      const SPF = await ethers.getContractFactory("SafeProxyFactory");
+
+      await expect(
+        SPF.deploy(await pwImpl.getAddress(), await exchange.getAddress(), ethers.ZeroAddress, ethers.ZeroAddress),
       ).to.be.revertedWithCustomError(SPF, "ZeroAddress");
     });
   });

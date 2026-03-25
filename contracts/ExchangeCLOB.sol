@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts-upgradeable/access/extensions/AccessControlEnumerableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/interfaces/IERC1271.sol";
 import "./Roles.sol";
 import "./ConditionalTokens.sol";
@@ -19,7 +20,13 @@ import "./MarketRegistry.sol";
 ///         Users hold tokens in their own wallets (ProxyWallet). Exchange pulls via approval.
 ///         No deposit/withdraw — Exchange never custodies user funds (except transiently for MINT/MERGE).
 /// @dev EIP-712 signed orders. MatchType: COMPLEMENTARY, MINT, MERGE.
-contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
+contract ExchangeCLOB is
+    Initializable,
+    AccessControlEnumerableUpgradeable,
+    EIP712Upgradeable,
+    ERC1155Holder,
+    UUPSUpgradeable
+{
     using SafeERC20 for IERC20;
 
     // ─── Enums ───
@@ -109,6 +116,18 @@ contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
     event Swept(address indexed token, uint256 amount);
     event SanctionUpdated(address indexed user, bool sanctioned_);
 
+    // ─── Reentrancy Guard (inline — OZ v5 removed ReentrancyGuardUpgradeable) ───
+    uint256 private _reentrancyStatus;
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    modifier nonReentrant() {
+        require(_reentrancyStatus != _ENTERED, "ReentrancyGuard: reentrant call");
+        _reentrancyStatus = _ENTERED;
+        _;
+        _reentrancyStatus = _NOT_ENTERED;
+    }
+
     // ─── Constants ───
     uint256 public constant MAX_FEE = 500; // 500 bps, immutable
     uint256 public constant MIN_ORDER = 1e18;
@@ -129,26 +148,35 @@ contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
     mapping(address => uint256) public unclaimedFees;                      // feeCollector => unclaimed
     mapping(address => bool) public sanctioned;
 
-    IERC20 public immutable usdt;
-    ConditionalTokens public immutable conditionalTokens;
-    MarketRegistry public immutable marketRegistry;
+    IERC20 public usdt;                         // was immutable
+    ConditionalTokens public conditionalTokens; // was immutable
+    MarketRegistry public marketRegistry;       // was immutable
     address public feeCollector;
     address public treasury;
 
-    // ─── Constructor ───
-    constructor(
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(
         address _usdt,
         address _conditionalTokens,
         address _marketRegistry,
         address _feeCollector,
         address _treasury
-    ) EIP712("GameClub Exchange", "1") {
+    ) external initializer {
         // L-3: Zero-address checks
         require(_usdt != address(0), "Zero usdt");
         require(_conditionalTokens != address(0), "Zero ct");
         require(_marketRegistry != address(0), "Zero registry");
         require(_feeCollector != address(0), "Zero feeCollector");
         require(_treasury != address(0), "Zero treasury");
+
+        __AccessControlEnumerable_init();
+        __EIP712_init("GameClub Exchange", "1");
+        _reentrancyStatus = _NOT_ENTERED;
+
         usdt = IERC20(_usdt);
         conditionalTokens = ConditionalTokens(_conditionalTokens);
         marketRegistry = MarketRegistry(_marketRegistry);
@@ -156,6 +184,9 @@ contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
         treasury = _treasury;
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
     }
+
+    // ─── UUPS Authorization ───
+    function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
 
     // ─── Modifiers ───
     modifier notFreezeAll() {
@@ -303,7 +334,8 @@ contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
         ctx.marketId = fill.makerOrder.marketId;
         ctx.executionPrice = fill.makerOrder.price; // Maker price (Surplus Matching)
         // M-5: ceilDiv for buyer cost (round in protocol's favor)
-        ctx.fillValue = _ceilDiv(ctx.executionPrice * fill.fillAmount, 1e18);
+        // Use market's collateralPerSet instead of hardcoded 1e18
+        ctx.fillValue = _ceilDiv(ctx.executionPrice * fill.fillAmount, 1e18); // price is always fraction of 1e18
         ctx.outcomeIndex = fill.makerOrder.outcomeIndex;
         ctx.makerHash = makerHash;
         ctx.takerHash = takerHash;
@@ -368,13 +400,17 @@ contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
 
     /// @dev MINT: cross-outcome BUY+BUY → splitPosition
     function _executeMint(Fill calldata fill, FillCtx memory ctx) internal returns (string memory) {
+        uint256 cps = _getCollateralPerSet(ctx.marketId);
+        // collateral = fillAmount * collateralPerSet / 1e18 (how much USDT to split)
+        uint256 collateral = (fill.fillAmount * cps) / 1e18;
+        // Prices are fractions of collateralPerSet; makerCost = price * fillAmount / 1e18
         uint256 makerCost = (fill.makerOrder.price * fill.fillAmount) / 1e18;
-        uint256 takerCost = fill.fillAmount - makerCost + fill.fee;
+        uint256 takerCost = collateral - makerCost + fill.fee;
 
-        if (fill.makerOrder.price + fill.takerOrder.price < 1e18) return "price_sum_below_one";
+        if (fill.makerOrder.price + fill.takerOrder.price < cps) return "price_sum_below_one";
 
-        // Fee check
-        if (fill.fillAmount > 0 && fill.fee * 10_000 > fill.fillAmount * MAX_FEE) return "fee_too_high";
+        // Fee check against collateral (not shares)
+        if (collateral > 0 && fill.fee * 10_000 > collateral * MAX_FEE) return "fee_too_high";
 
         // Non-custodial balance + allowance checks
         if (usdt.balanceOf(fill.makerOrder.maker) < makerCost) return "maker_insufficient_balance";
@@ -388,14 +424,16 @@ contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
 
     /// @dev MERGE: cross-outcome SELL+SELL → mergePositions
     function _executeMerge(Fill calldata fill, FillCtx memory ctx) internal returns (string memory) {
-        if (fill.makerOrder.price + fill.takerOrder.price > 1e18) return "price_sum_above_one";
+        uint256 cps = _getCollateralPerSet(ctx.marketId);
+        if (fill.makerOrder.price + fill.takerOrder.price > cps) return "price_sum_above_one";
 
-        // Fee check
-        if (fill.fillAmount > 0 && fill.fee * 10_000 > fill.fillAmount * MAX_FEE) return "fee_too_high";
+        // Fee check: fee against collateral, not shares
+        uint256 collateral = (fill.fillAmount * cps) / 1e18;
+        if (collateral > 0 && fill.fee * 10_000 > collateral * MAX_FEE) return "fee_too_high";
 
         // H-1: Fee underflow guard — check fee doesn't exceed taker proceeds
         uint256 makerPay = (fill.makerOrder.price * fill.fillAmount) / 1e18;
-        uint256 takerPay = fill.fillAmount - makerPay;
+        uint256 takerPay = collateral - makerPay;
         if (fill.fee > takerPay) return "fee_exceeds_taker_proceeds";
 
         // Non-custodial shares checks
@@ -459,6 +497,8 @@ contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
         uint256 makerCost, uint256 takerCost
     ) internal {
         uint256 amt = fill.fillAmount;
+        uint256 cps = _getCollateralPerSet(ctx.marketId);
+        uint256 collateral = (amt * cps) / 1e18;
         address makerAddr = fill.makerOrder.maker;
         address takerAddr = fill.takerOrder.maker;
 
@@ -467,7 +507,7 @@ contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
         filled[ctx.takerHash] += amt;
 
         // ── 2. M-4: MINT = volume + OI increase (correct) ──
-        marketRegistry.addVolumeAndOI(ctx.marketId, amt, amt);
+        marketRegistry.addVolumeAndOI(ctx.marketId, collateral, amt);
 
         // ── 3. Dust Kill (M-1: by orderHash) ──
         _dustKill(ctx.makerHash, fill.makerOrder.amount);
@@ -477,11 +517,11 @@ contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
         usdt.safeTransferFrom(makerAddr, address(this), makerCost);
         usdt.safeTransferFrom(takerAddr, address(this), takerCost);
 
-        // ── 5. Split + distribute shares ──
-        _splitAndDistribute(fill, ctx, makerAddr, takerAddr, amt);
+        // ── 5. Split collateral + distribute shares (shares = collateral units) ──
+        _splitAndDistribute(fill, ctx, makerAddr, takerAddr, collateral);
 
         // ── 6. Fee + surplus ──
-        _handleMintSurplus(fill.fee, makerCost + takerCost, amt);
+        _handleMintSurplus(fill.fee, makerCost + takerCost, collateral);
 
         // L-7: matchType in event
         emit FillExecuted(
@@ -522,6 +562,8 @@ contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
         uint256 makerPosId, uint256 takerPosId, uint256 makerPay
     ) internal {
         uint256 amt = fill.fillAmount;
+        uint256 cps = _getCollateralPerSet(ctx.marketId);
+        uint256 collateral = (amt * cps) / 1e18;
         address makerAddr = fill.makerOrder.maker;
         address takerAddr = fill.takerOrder.maker;
 
@@ -538,14 +580,14 @@ contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
         _dustKill(ctx.takerHash, fill.takerOrder.amount);
 
         // ── 4. Pull shares from both sellers into Exchange (transient) ──
-        conditionalTokens.safeTransferFrom(makerAddr, address(this), makerPosId, amt, "");
-        conditionalTokens.safeTransferFrom(takerAddr, address(this), takerPosId, amt, "");
+        conditionalTokens.safeTransferFrom(makerAddr, address(this), makerPosId, collateral, "");
+        conditionalTokens.safeTransferFrom(takerAddr, address(this), takerPosId, collateral, "");
 
         // ── 5. Merge: burn YES+NO shares → get USDT back ──
-        conditionalTokens.mergePositions(ctx.conditionId, amt);
+        conditionalTokens.mergePositions(ctx.conditionId, collateral);
 
         // ── 6. Distribute USDT + fee ──
-        _distributeMergeProceeds(fill, makerAddr, takerAddr, makerPay, amt);
+        _distributeMergeProceeds(fill, makerAddr, takerAddr, makerPay, collateral);
 
         // L-7: matchType in event
         emit FillExecuted(
@@ -655,10 +697,6 @@ contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
         emit FeesClaimed(msg.sender, amount);
     }
 
-    // ─── Reject BNB ───
-    fallback() external payable { revert(); }
-    receive() external payable { revert(); }
-
     // ═══════════════════════════════════════════════════════
     // EIP-712 HELPERS
     // ═══════════════════════════════════════════════════════
@@ -698,6 +736,10 @@ contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
 
     // ─── Internal Helpers ───
 
+    function _getCollateralPerSet(uint256 marketId) internal view returns (uint256) {
+        return marketRegistry.getCollateralPerSet(marketId);
+    }
+
     function _getPositionId(bytes32 conditionId, uint256 outcomeIndex) internal view returns (uint256) {
         uint256 indexSet = 1 << outcomeIndex;
         bytes32 collectionId = conditionalTokens.getCollectionId(conditionId, indexSet);
@@ -706,8 +748,11 @@ contract ExchangeCLOB is AccessControl, EIP712, ReentrancyGuard, ERC1155Holder {
 
     // ─── ERC1155 Receiver (needed for transient MINT/MERGE custody) ───
     function supportsInterface(bytes4 interfaceId)
-        public view override(AccessControl, ERC1155Holder) returns (bool)
+        public view override(AccessControlEnumerableUpgradeable, ERC1155Holder) returns (bool)
     {
         return super.supportsInterface(interfaceId);
     }
+
+    // ─── Storage Gap ───
+    uint256[47] private __gap;
 }

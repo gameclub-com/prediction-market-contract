@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts-upgradeable/access/extensions/AccessControlEnumerableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "./Roles.sol";
 import "./ConditionalTokens.sol";
 
 /// @title MarketRegistry — Market creation, lifecycle, and resolution management
-contract MarketRegistry is AccessControl {
+contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UUPSUpgradeable {
     // ─── Errors ───
     error QuestionIdAlreadyUsed(bytes32 questionId);
     error InvalidOutcomeSlotCount(uint256 count);
@@ -65,6 +67,7 @@ contract MarketRegistry is AccessControl {
         uint256 outcomeSlotCount;
         uint256 totalVolume;
         uint256 currentOI;
+        uint256 collateralPerSet; // USDT per full set of outcome tokens (default 1e18 = 1 USDT)
         bool resolved;
         bool finalized;
         bool frozen;
@@ -78,6 +81,7 @@ contract MarketRegistry is AccessControl {
         string[] tags;
         uint256 cutoff;
         uint256 outcomeSlotCount;
+        uint256 collateralPerSet; // 0 = default (1e18), or 1e18 / 1e17 / 1e16
     }
 
     struct ArbitrationProfile {
@@ -97,9 +101,9 @@ contract MarketRegistry is AccessControl {
     mapping(uint256 => uint256) public marketEventId; // marketId => eventId
     mapping(bytes32 => uint256) public questionIdToMarketId;
     mapping(bytes32 => ArbitrationProfile) public profiles;
-    uint256 public nextMarketId = 1;
+    uint256 public nextMarketId;
 
-    ConditionalTokens public immutable conditionalTokens;
+    ConditionalTokens public conditionalTokens; // was immutable
     address public oracleRouter;
 
     // H-4 v2: 2-step oracle router change with delay
@@ -113,10 +117,21 @@ contract MarketRegistry is AccessControl {
         _;
     }
 
-    constructor(address _conditionalTokens) {
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(address _conditionalTokens) external initializer {
+        __AccessControlEnumerable_init();
+
         conditionalTokens = ConditionalTokens(_conditionalTokens);
+        nextMarketId = 1;
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
     }
+
+    // ─── UUPS Authorization ───
+    function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
 
     // H-4 v2: 2-step oracle router change with 24h delay
     function proposeOracleRouter(address _newRouter) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -253,6 +268,11 @@ contract MarketRegistry is AccessControl {
             address(this), params.questionId, params.outcomeSlotCount
         );
 
+        // Validate collateralPerSet (0 = default 1e18, or must be 1e18/1e17/1e16)
+        uint256 cps = params.collateralPerSet;
+        if (cps == 0) cps = 1e18;
+        require(cps == 1e18 || cps == 1e17 || cps == 1e16, "Invalid collateralPerSet");
+
         marketId = nextMarketId++;
         markets[marketId] = Market({
             questionId: params.questionId,
@@ -265,6 +285,7 @@ contract MarketRegistry is AccessControl {
             outcomeSlotCount: params.outcomeSlotCount,
             totalVolume: 0,
             currentOI: 0,
+            collateralPerSet: cps,
             resolved: false,
             finalized: false,
             frozen: false,
@@ -460,6 +481,11 @@ contract MarketRegistry is AccessControl {
 
     // ─── View ───
 
+    function getCollateralPerSet(uint256 marketId) external view returns (uint256) {
+        uint256 cps = markets[marketId].collateralPerSet;
+        return cps > 0 ? cps : 1e18;
+    }
+
     function getMarket(uint256 marketId) external view returns (Market memory) {
         return markets[marketId];
     }
@@ -476,4 +502,7 @@ contract MarketRegistry is AccessControl {
         Market storage m = markets[marketId];
         return (m.endTime, m.tradingCutoff, m.currentOI, m.maxOpenInterest, m.resolved, m.finalized, m.conditionId);
     }
+
+    // ─── Storage Gap ───
+    uint256[49] private __gap;
 }

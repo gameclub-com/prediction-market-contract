@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC1155/ERC1155Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title ConditionalTokens — ERC1155 outcome tokens for prediction markets
 /// @notice v1: outcomeSlotCount == 2 only. Gnosis CTF-style.
-contract ConditionalTokens is ERC1155, ReentrancyGuard {
+contract ConditionalTokens is Initializable, ERC1155Upgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
     // ─── Errors ───
@@ -63,11 +64,24 @@ contract ConditionalTokens is ERC1155, ReentrancyGuard {
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
 
     // ─── Constants ───
-    uint256 public constant MIN_REDEEM = 0.1e18; // 0.1 USDT
+    uint256 public constant MIN_REDEEM = 0.001e18; // 0.001 USDT (supports 0.01 USDT markets)
+
+    // ─── Reentrancy Guard (inline — OZ v5 removed ReentrancyGuardUpgradeable) ───
+    uint256 private _reentrancyStatus;
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    modifier nonReentrant() {
+        require(_reentrancyStatus != _ENTERED, "ReentrancyGuard: reentrant call");
+        _reentrancyStatus = _ENTERED;
+        _;
+        _reentrancyStatus = _NOT_ENTERED;
+    }
 
     // ─── State ───
-    IERC20 public immutable collateralToken; // USDT
+    IERC20 public collateralToken; // USDT (was immutable)
     address public treasury;
+    address public admin; // upgrade authority
 
     // conditionId => outcome payouts
     mapping(bytes32 => uint256[]) public payoutNumerators;
@@ -87,12 +101,27 @@ contract ConditionalTokens is ERC1155, ReentrancyGuard {
     // C-1: Per-condition collateral accounting
     mapping(bytes32 => uint256) public conditionCollateral;
 
-    constructor(address _collateralToken, address _treasury) ERC1155("") {
-        // L-3: Zero-address checks
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(address _collateralToken, address _treasury, address _admin) external initializer {
         require(_collateralToken != address(0), "Zero collateralToken");
         require(_treasury != address(0), "Zero treasury");
+        require(_admin != address(0), "Zero admin");
+
+        __ERC1155_init("");
+        _reentrancyStatus = _NOT_ENTERED;
+
         collateralToken = IERC20(_collateralToken);
         treasury = _treasury;
+        admin = _admin;
+    }
+
+    // ─── UUPS Authorization ───
+    function _authorizeUpgrade(address) internal override {
+        require(msg.sender == admin, "Only admin");
     }
 
     // ─── L-4: Treasury setter ───
@@ -370,4 +399,7 @@ contract ConditionalTokens is ERC1155, ReentrancyGuard {
             unchecked { i++; }
         }
     }
+
+    // ─── Storage Gap ───
+    uint256[48] private __gap;
 }

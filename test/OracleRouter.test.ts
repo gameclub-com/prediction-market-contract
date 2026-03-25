@@ -1,6 +1,6 @@
 import { loadFixture, time } from "@nomicfoundation/hardhat-network-helpers";
 import { expect } from "chai";
-import { ethers } from "hardhat";
+import { ethers, upgrades } from "hardhat";
 import type {
   CentralizedOracleRouter,
   MarketRegistry,
@@ -34,17 +34,19 @@ async function oracleFixture() {
   const usdt = await MockUSDT.deploy();
 
   const CT = await ethers.getContractFactory("ConditionalTokens");
-  const ct = await CT.deploy(await usdt.getAddress(), treasury.address);
+  const ct = await upgrades.deployProxy(CT, [await usdt.getAddress(), treasury.address, deployer.address], {
+    kind: 'uups', initializer: 'initialize',
+  });
 
   const MR = await ethers.getContractFactory("MarketRegistry");
-  const registry = await MR.deploy(await ct.getAddress());
+  const registry = await upgrades.deployProxy(MR, [await ct.getAddress()], {
+    kind: 'uups', initializer: 'initialize',
+  });
 
   const Router = await ethers.getContractFactory("CentralizedOracleRouter");
-  const router = await Router.deploy(
-    await registry.getAddress(),
-    await usdt.getAddress(),
-    treasury.address,
-  );
+  const router = await upgrades.deployProxy(Router, [await registry.getAddress(), await usdt.getAddress(), treasury.address], {
+    kind: 'uups', initializer: 'initialize',
+  });
 
   // H-4 v2: Wire oracle router (2-step with 24h delay)
   await registry.proposeOracleRouter(await router.getAddress());
@@ -85,7 +87,7 @@ async function oracleFixture() {
     profileHash,
     tags: ["crypto"],
     cutoff: MARKET_CUTOFF,
-    outcomeSlotCount: 2,
+    outcomeSlotCount: 2, collateralPerSet: 0,
   });
 
   // Create market with disputes disabled
@@ -96,7 +98,7 @@ async function oracleFixture() {
     profileHash: noDisputeProfile,
     tags: ["crypto"],
     cutoff: MARKET_CUTOFF,
-    outcomeSlotCount: 2,
+    outcomeSlotCount: 2, collateralPerSet: 0,
   });
 
   // H-2 v2: Advance past cutoff so proposeOutcome works in all tests
@@ -132,7 +134,9 @@ describe("CentralizedOracleRouter", function () {
     it("should revert with zero address", async function () {
       const Router = await ethers.getContractFactory("CentralizedOracleRouter");
       await expect(
-        Router.deploy(ethers.ZeroAddress, ethers.ZeroAddress, ethers.ZeroAddress),
+        upgrades.deployProxy(Router, [ethers.ZeroAddress, ethers.ZeroAddress, ethers.ZeroAddress], {
+          kind: 'uups', initializer: 'initialize',
+        }),
       ).to.be.revertedWithCustomError(Router, "ZeroAddress");
     });
   });
@@ -620,7 +624,7 @@ describe("CentralizedOracleRouter", function () {
         profileHash,
         tags: ["test"],
         cutoff: now + 86400 * 29,
-        outcomeSlotCount: 2,
+        outcomeSlotCount: 2, collateralPerSet: 0,
       });
 
       // Market 3 has far-future cutoff — cannot propose yet
@@ -642,7 +646,7 @@ describe("CentralizedOracleRouter", function () {
         profileHash,
         tags: ["test"],
         cutoff: now + 86400 * 29,
-        outcomeSlotCount: 2,
+        outcomeSlotCount: 2, collateralPerSet: 0,
       });
 
       // SAFETY_COUNCIL can resolve at any time
@@ -655,7 +659,106 @@ describe("CentralizedOracleRouter", function () {
   });
 
   // -----------------------------------------------------------------------
-  // 13. rescueBond
+  // 13. Dispute window blocks redemption (isResolved = false until finalized)
+  // -----------------------------------------------------------------------
+  describe("Dispute window blocks on-chain redemption", function () {
+    it("redeemPositions reverts during dispute window (isResolved is false)", async function () {
+      const { proposer, router, ct, registry, usdt, disputer } =
+        await loadFixture(oracleFixture);
+
+      // Mint USDT and split to get outcome tokens
+      const market = await registry.getMarket(1);
+      const conditionId = market.conditionId;
+      const splitAmount = ethers.parseEther("100");
+      await usdt.mint(disputer.address, splitAmount);
+      await usdt.connect(disputer).approve(await ct.getAddress(), splitAmount);
+      await ct.connect(disputer).splitPosition(conditionId, splitAmount);
+
+      // Propose outcome (starts dispute window)
+      await router.connect(proposer).proposeOutcome(1, 0);
+
+      // Verify: market is resolved but NOT finalized
+      const marketAfter = await registry.getMarket(1);
+      expect(marketAfter.resolved).to.be.true;
+      expect(marketAfter.finalized).to.be.false;
+
+      // Verify: ConditionalTokens isResolved is still FALSE (reportPayouts not called yet)
+      expect(await ct.isResolved(conditionId)).to.be.false;
+
+      // Attempt to redeem during dispute window — should revert
+      await expect(
+        ct.connect(disputer).redeemPositions(conditionId, [1]),
+      ).to.be.revertedWithCustomError(ct, "ConditionNotResolved");
+    });
+
+    it("redeemPositions succeeds after finalization (dispute window expired)", async function () {
+      const { proposer, router, ct, registry, usdt, disputer } =
+        await loadFixture(oracleFixture);
+
+      // Split to get outcome tokens
+      const market = await registry.getMarket(1);
+      const conditionId = market.conditionId;
+      const splitAmount = ethers.parseEther("100");
+      await usdt.mint(disputer.address, splitAmount);
+      await usdt.connect(disputer).approve(await ct.getAddress(), splitAmount);
+      await ct.connect(disputer).splitPosition(conditionId, splitAmount);
+
+      // Propose → wait dispute window → finalize
+      await router.connect(proposer).proposeOutcome(1, 0);
+      await time.increase(DISPUTE_WINDOW + 1);
+      await router.finalizeOutcome(1);
+
+      // Now isResolved should be true
+      expect(await ct.isResolved(conditionId)).to.be.true;
+
+      // Redeem winning outcome (outcome 0)
+      const balBefore = await usdt.balanceOf(disputer.address);
+      await ct.connect(disputer).redeemPositions(conditionId, [1]); // indexSet 1 = outcome 0
+      const balAfter = await usdt.balanceOf(disputer.address);
+
+      expect(balAfter - balBefore).to.equal(splitAmount);
+    });
+
+    it("redeemPositions succeeds after council resolve (dispute upheld)", async function () {
+      const { proposer, council, disputer, router, ct, registry, usdt } =
+        await loadFixture(oracleFixture);
+
+      // Split to get outcome tokens
+      const market = await registry.getMarket(1);
+      const conditionId = market.conditionId;
+      const splitAmount = ethers.parseEther("100");
+      await usdt.mint(disputer.address, splitAmount);
+      await usdt.connect(disputer).approve(await ct.getAddress(), splitAmount);
+      await ct.connect(disputer).splitPosition(conditionId, splitAmount);
+
+      // Propose → dispute → council resolves with different outcome
+      await router.connect(proposer).proposeOutcome(1, 0);
+      await usdt.connect(disputer).approve(await router.getAddress(), DISPUTE_BOND);
+      await router.connect(disputer).disputeOutcome(1);
+
+      // During dispute: redeem should still fail
+      expect(await ct.isResolved(conditionId)).to.be.false;
+      await expect(
+        ct.connect(disputer).redeemPositions(conditionId, [1]),
+      ).to.be.revertedWithCustomError(ct, "ConditionNotResolved");
+
+      // Council resolves with outcome 1 (overturns proposal)
+      await router.connect(council).councilResolve(1, 1);
+
+      // Now isResolved should be true
+      expect(await ct.isResolved(conditionId)).to.be.true;
+
+      // Redeem outcome 1 (winning after council override)
+      const balBefore = await usdt.balanceOf(disputer.address);
+      await ct.connect(disputer).redeemPositions(conditionId, [2]); // indexSet 2 = outcome 1
+      const balAfter = await usdt.balanceOf(disputer.address);
+
+      expect(balAfter - balBefore).to.equal(splitAmount);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 14. rescueBond
   // -----------------------------------------------------------------------
   describe("rescueBond", function () {
     it("rescues bond from orphaned disputed proposal", async function () {
@@ -689,6 +792,181 @@ describe("CentralizedOracleRouter", function () {
       await expect(
         router.connect(council).rescueBond(1),
       ).to.be.revertedWithCustomError(router, "ProposalNotDisputed");
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 15. proposeOutcomeBatch — multi-market resolution in single tx
+  // -----------------------------------------------------------------------
+  describe("proposeOutcomeBatch", function () {
+    // Helper: create multiple markets for batch testing
+    async function batchFixture() {
+      const base = await loadFixture(oracleFixture);
+      const { registry, marketAdmin } = base;
+
+      const now = await time.latest();
+      const cutoff = now + 100;
+      const endTime = now + 200;
+
+      // Create 3 more markets (market IDs 3, 4, 5) — all dispute-enabled
+      for (let i = 0; i < 3; i++) {
+        const qid = ethers.keccak256(ethers.toUtf8Bytes(`batch-market-${i}`));
+        await registry.connect(marketAdmin).createMarket({
+          questionId: qid,
+          endTime,
+          profileHash: base.profileHash,
+          tags: ["batch"],
+          cutoff,
+          outcomeSlotCount: 2,
+          collateralPerSet: 0,
+        });
+      }
+
+      // Create 2 more markets (market IDs 6, 7) — no-dispute (immediate finalization)
+      for (let i = 0; i < 2; i++) {
+        const qid = ethers.keccak256(ethers.toUtf8Bytes(`batch-nodispute-${i}`));
+        await registry.connect(marketAdmin).createMarket({
+          questionId: qid,
+          endTime,
+          profileHash: base.noDisputeProfile,
+          tags: ["batch"],
+          cutoff,
+          outcomeSlotCount: 2,
+          collateralPerSet: 0,
+        });
+      }
+
+      // Advance past cutoff
+      await time.increase(101);
+
+      return base;
+    }
+
+    it("should propose multiple dispute-enabled markets in one tx", async function () {
+      const { proposer, router, registry } = await batchFixture();
+
+      await router.connect(proposer).proposeOutcomeBatch(
+        [3, 4, 5],
+        [0, 1, 0],
+      );
+
+      // All should be PROPOSED with dispute window
+      for (const id of [3, 4, 5]) {
+        const proposal = await router.getProposal(id);
+        expect(proposal.status).to.equal(1); // PROPOSED
+
+        const market = await registry.getMarket(id);
+        expect(market.resolved).to.be.true;
+        expect(market.finalized).to.be.false;
+      }
+
+      expect((await router.getProposal(3)).outcomeIndex).to.equal(0);
+      expect((await router.getProposal(4)).outcomeIndex).to.equal(1);
+      expect((await router.getProposal(5)).outcomeIndex).to.equal(0);
+    });
+
+    it("should finalize immediately for no-dispute markets in batch", async function () {
+      const { proposer, router, registry } = await batchFixture();
+
+      await router.connect(proposer).proposeOutcomeBatch(
+        [6, 7],
+        [0, 1],
+      );
+
+      for (const id of [6, 7]) {
+        const proposal = await router.getProposal(id);
+        expect(proposal.status).to.equal(3); // FINALIZED
+
+        const market = await registry.getMarket(id);
+        expect(market.resolved).to.be.true;
+        expect(market.finalized).to.be.true;
+      }
+    });
+
+    it("should handle mixed dispute/no-dispute markets in one batch", async function () {
+      const { proposer, router, registry } = await batchFixture();
+
+      // 3 = dispute-enabled, 6 = no-dispute
+      await router.connect(proposer).proposeOutcomeBatch(
+        [3, 6],
+        [0, 1],
+      );
+
+      // Market 3: PROPOSED (dispute window)
+      const p3 = await router.getProposal(3);
+      expect(p3.status).to.equal(1);
+      const m3 = await registry.getMarket(3);
+      expect(m3.resolved).to.be.true;
+      expect(m3.finalized).to.be.false;
+
+      // Market 6: FINALIZED (no dispute)
+      const p6 = await router.getProposal(6);
+      expect(p6.status).to.equal(3);
+      const m6 = await registry.getMarket(6);
+      expect(m6.resolved).to.be.true;
+      expect(m6.finalized).to.be.true;
+    });
+
+    it("should revert on array length mismatch", async function () {
+      const { proposer, router } = await batchFixture();
+
+      await expect(
+        router.connect(proposer).proposeOutcomeBatch([3, 4], [0]),
+      ).to.be.revertedWith("Array length mismatch");
+    });
+
+    it("should revert on empty batch", async function () {
+      const { proposer, router } = await batchFixture();
+
+      await expect(
+        router.connect(proposer).proposeOutcomeBatch([], []),
+      ).to.be.revertedWith("Empty batch");
+    });
+
+    it("should revert for non-proposer", async function () {
+      const { disputer, router } = await batchFixture();
+
+      await expect(
+        router.connect(disputer).proposeOutcomeBatch([3], [0]),
+      ).to.be.reverted;
+    });
+
+    it("should revert entire batch if any market already proposed", async function () {
+      const { proposer, router } = await batchFixture();
+
+      // Propose market 3 individually first
+      await router.connect(proposer).proposeOutcome(3, 0);
+
+      // Batch including already-proposed market 3 should revert
+      await expect(
+        router.connect(proposer).proposeOutcomeBatch([3, 4], [1, 0]),
+      ).to.be.revertedWithCustomError(router, "ProposalAlreadyExists");
+    });
+
+    it("E2E: batch propose → dispute one → council resolve → finalize others", async function () {
+      const { proposer, council, disputer, router, registry, usdt } = await batchFixture();
+
+      // 1. Batch propose markets 3, 4, 5 (all dispute-enabled)
+      await router.connect(proposer).proposeOutcomeBatch([3, 4, 5], [0, 1, 0]);
+
+      // 2. Dispute market 4 only
+      await usdt.connect(disputer).approve(await router.getAddress(), DISPUTE_BOND);
+      await router.connect(disputer).disputeOutcome(4);
+
+      expect((await router.getProposal(4)).status).to.equal(2); // DISPUTED
+
+      // 3. Council resolves market 4
+      await router.connect(council).councilResolve(4, 1);
+      expect((await router.getProposal(4)).status).to.equal(3); // FINALIZED
+      expect((await registry.getMarket(4)).finalized).to.be.true;
+
+      // 4. Wait for dispute window and finalize markets 3, 5
+      await time.increase(DISPUTE_WINDOW + 1);
+      await router.finalizeOutcome(3);
+      await router.finalizeOutcome(5);
+
+      expect((await registry.getMarket(3)).finalized).to.be.true;
+      expect((await registry.getMarket(5)).finalized).to.be.true;
     });
   });
 });

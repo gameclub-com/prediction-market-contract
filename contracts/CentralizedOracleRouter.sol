@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts-upgradeable/access/extensions/AccessControlEnumerableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./IOracleRouter.sol";
 import "./MarketRegistry.sol";
 import "./Roles.sol";
@@ -13,7 +14,12 @@ import "./Roles.sol";
 /// @notice Phase 1: centralized proposer + permissionless dispute + council resolution.
 ///         Implements IOracleRouter so it can be swapped for UMA/Chainlink adapter later.
 /// @dev MarketRegistry delegates resolution to this contract via oracleRouter address.
-contract CentralizedOracleRouter is IOracleRouter, AccessControl, ReentrancyGuard {
+contract CentralizedOracleRouter is
+    IOracleRouter,
+    Initializable,
+    AccessControlEnumerableUpgradeable,
+    UUPSUpgradeable
+{
     using SafeERC20 for IERC20;
 
     // ─── Errors ───
@@ -30,27 +36,50 @@ contract CentralizedOracleRouter is IOracleRouter, AccessControl, ReentrancyGuar
     event EmergencyRejected(uint256 indexed marketId, address indexed rejectedBy);
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
 
+    // ─── Reentrancy Guard (inline — OZ v5 removed ReentrancyGuardUpgradeable) ───
+    uint256 private _reentrancyStatus;
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    modifier nonReentrant() {
+        require(_reentrancyStatus != _ENTERED, "ReentrancyGuard: reentrant call");
+        _reentrancyStatus = _ENTERED;
+        _;
+        _reentrancyStatus = _NOT_ENTERED;
+    }
+
     // ─── State ───
-    MarketRegistry public immutable marketRegistry;
-    IERC20 public immutable bondToken;
+    MarketRegistry public marketRegistry; // was immutable
+    IERC20 public bondToken;              // was immutable
     address public treasury;
 
     mapping(uint256 => Proposal) private _proposals;
 
-    // ─── Constructor ───
-    constructor(
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(
         address _marketRegistry,
         address _bondToken,
         address _treasury
-    ) {
+    ) external initializer {
         if (_marketRegistry == address(0) || _bondToken == address(0) || _treasury == address(0)) {
             revert ZeroAddress();
         }
+
+        __AccessControlEnumerable_init();
+        _reentrancyStatus = _NOT_ENTERED;
+
         marketRegistry = MarketRegistry(_marketRegistry);
         bondToken = IERC20(_bondToken);
         treasury = _treasury;
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
     }
+
+    // ─── UUPS Authorization ───
+    function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
 
     // ═══════════════════════════════════════════════════════
     // IOracleRouter IMPLEMENTATION
@@ -61,9 +90,29 @@ contract CentralizedOracleRouter is IOracleRouter, AccessControl, ReentrancyGuar
         uint256 marketId,
         uint256 outcomeIndex
     ) external onlyRole(Roles.PROPOSER_ROLE) {
+        _proposeOutcome(marketId, outcomeIndex);
+    }
+
+    /// @notice Batch propose outcomes for multiple markets in a single transaction.
+    /// @param marketIds Array of market IDs to propose.
+    /// @param outcomeIndices Array of outcome indices (must match marketIds length).
+    function proposeOutcomeBatch(
+        uint256[] calldata marketIds,
+        uint256[] calldata outcomeIndices
+    ) external onlyRole(Roles.PROPOSER_ROLE) {
+        require(marketIds.length == outcomeIndices.length, "Array length mismatch");
+        require(marketIds.length > 0, "Empty batch");
+
+        for (uint256 i = 0; i < marketIds.length;) {
+            _proposeOutcome(marketIds[i], outcomeIndices[i]);
+            unchecked { i++; }
+        }
+    }
+
+    /// @dev Internal propose logic shared by proposeOutcome and proposeOutcomeBatch.
+    function _proposeOutcome(uint256 marketId, uint256 outcomeIndex) internal {
         if (outcomeIndex > 1) revert InvalidOutcome(outcomeIndex);
 
-        // H-2 v2: PROPOSER must wait until tradingCutoff or endTime has passed
         MarketRegistry.Market memory m = marketRegistry.getMarket(marketId);
         require(
             block.timestamp >= m.tradingCutoff || block.timestamp >= m.endTime,
@@ -71,19 +120,15 @@ contract CentralizedOracleRouter is IOracleRouter, AccessControl, ReentrancyGuar
         );
 
         Proposal storage p = _proposals[marketId];
-        // Allow re-proposal only if NONE or REJECTED
         if (p.status == ProposalStatus.PROPOSED || p.status == ProposalStatus.DISPUTED || p.status == ProposalStatus.FINALIZED) {
             revert ProposalAlreadyExists(marketId);
         }
 
-        // Get dispute config from market's profile
         (bool disputeEnabled, uint256 disputeWindow,) = marketRegistry.getDisputeConfig(marketId);
 
-        // Mark market as resolved (stops trading via ExchangeCLOB._checkMarket)
         marketRegistry.setResolved(marketId);
 
         if (!disputeEnabled || disputeWindow == 0) {
-            // No dispute window — finalize immediately
             marketRegistry.finalizeResolution(marketId, outcomeIndex);
 
             _proposals[marketId] = Proposal({
@@ -99,7 +144,6 @@ contract CentralizedOracleRouter is IOracleRouter, AccessControl, ReentrancyGuar
             emit OutcomeProposed(marketId, outcomeIndex, msg.sender, block.timestamp);
             emit OutcomeFinalized(marketId, outcomeIndex);
         } else {
-            // Start dispute window
             uint256 deadline = block.timestamp + disputeWindow;
 
             _proposals[marketId] = Proposal({
@@ -236,6 +280,25 @@ contract CentralizedOracleRouter is IOracleRouter, AccessControl, ReentrancyGuar
         uint256 marketId,
         uint256 outcomeIndex
     ) external onlyRole(Roles.SAFETY_COUNCIL_ROLE) nonReentrant {
+        _emergencyResolve(marketId, outcomeIndex);
+    }
+
+    /// @notice Batch emergency resolution for multiple markets in a single transaction.
+    function emergencyResolveBatch(
+        uint256[] calldata marketIds,
+        uint256[] calldata outcomeIndices
+    ) external onlyRole(Roles.SAFETY_COUNCIL_ROLE) nonReentrant {
+        require(marketIds.length == outcomeIndices.length, "Array length mismatch");
+        require(marketIds.length > 0, "Empty batch");
+
+        for (uint256 i = 0; i < marketIds.length;) {
+            _emergencyResolve(marketIds[i], outcomeIndices[i]);
+            unchecked { i++; }
+        }
+    }
+
+    /// @dev Internal emergency resolve logic shared by single and batch variants.
+    function _emergencyResolve(uint256 marketId, uint256 outcomeIndex) internal {
         if (outcomeIndex > 1) revert InvalidOutcome(outcomeIndex);
 
         Proposal storage p = _proposals[marketId];
@@ -296,4 +359,7 @@ contract CentralizedOracleRouter is IOracleRouter, AccessControl, ReentrancyGuar
         treasury = _treasury;
         emit TreasuryUpdated(old, _treasury);
     }
+
+    // ─── Storage Gap ───
+    uint256[48] private __gap;
 }
