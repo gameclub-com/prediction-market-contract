@@ -21,7 +21,7 @@ contract ProxyWallet is IERC1271, ERC1155Holder {
     bytes32 private constant HASHED_VERSION = keccak256("1");
 
     bytes32 public constant EXECUTE_TYPEHASH =
-        keccak256("Execute(address target,uint256 value,bytes32 dataHash,uint256 nonce)");
+        keccak256("Execute(address target,uint256 value,bytes32 dataHash,uint256 nonce,uint256 deadline)");
     bytes32 public constant EXECUTE_BATCH_TYPEHASH =
         keccak256("ExecuteBatch(bytes32 targetsHash,bytes32 valuesHash,bytes32 datasHash,uint256 nonce)");
 
@@ -41,6 +41,7 @@ contract ProxyWallet is IERC1271, ERC1155Holder {
     error NonceAlreadyUsed();
     error CallFailed(bytes returnData);
     error SetupCallFailed(uint256 index, bytes returnData);
+    error DeadlineExpired();
 
     // ─── Events ───
     event Executed(address indexed target, uint256 value, bytes data);
@@ -70,6 +71,7 @@ contract ProxyWallet is IERC1271, ERC1155Holder {
                 uint256[] memory values,
                 bytes[] memory datas
             ) = abi.decode(setupData, (address[], uint256[], bytes[]));
+            require(targets.length == values.length && values.length == datas.length, "length mismatch");
             for (uint256 i = 0; i < targets.length;) {
                 (bool success, bytes memory result) = targets[i].call{value: values[i]}(datas[i]);
                 if (!success) revert SetupCallFailed(i, result);
@@ -109,24 +111,25 @@ contract ProxyWallet is IERC1271, ERC1155Holder {
     }
 
     // ─── Meta-transaction: executeOnBehalf (relayer submits owner's signed intent) ───
-    /// @notice Allows anyone (typically a relayer) to execute a call on behalf of the owner
-    ///         by providing the owner's EIP-712 signature over the call parameters.
     /// @param target  The address to call
     /// @param value   The ETH value to send
     /// @param data    The calldata to send
     /// @param nonce   A unique nonce for replay protection
+    /// @param deadline  Expiration timestamp (0 = no expiry)
     /// @param ownerSignature  The owner's EIP-712 signature
     function executeOnBehalf(
         address target,
         uint256 value,
         bytes calldata data,
         uint256 nonce,
+        uint256 deadline,
         bytes calldata ownerSignature
     ) external returns (bytes memory) {
         if (usedNonces[nonce]) revert NonceAlreadyUsed();
+        if (deadline > 0 && block.timestamp > deadline) revert DeadlineExpired();
 
         bytes32 structHash = keccak256(
-            abi.encode(EXECUTE_TYPEHASH, target, value, keccak256(data), nonce)
+            abi.encode(EXECUTE_TYPEHASH, target, value, keccak256(data), nonce, deadline)
         );
         bytes32 digest = _hashTypedDataV4(structHash);
         address signer = digest.recover(ownerSignature);

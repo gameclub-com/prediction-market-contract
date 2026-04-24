@@ -21,6 +21,7 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     error MarketNotFrozen(uint256 marketId);
     error MarketAlreadyFinalizedErr(uint256 marketId);
     error TooManyBatchMarkets(uint256 count, uint256 max);
+    error MarketIdAlreadyUsed(uint256 marketId);
     error ProfileNotFound(bytes32 profileHash);
     error Unauthorized();
     error InvalidEndTime();
@@ -46,6 +47,7 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     event MarketFreezeToggled(uint256 indexed marketId, bool frozen, address by);
     event MarketExpired(uint256 indexed marketId);
     event MarketUnresolved(uint256 indexed marketId);
+    event OIUnderflow(uint256 indexed marketId, uint256 currentOI, uint256 subtractedOI);
     event OracleRouterUpdated(address indexed oldRouter, address indexed newRouter);
     // H-4 v2: 2-step oracle router change events
     event OracleRouterChangeProposed(address indexed newRouter, uint256 executeAfter);
@@ -133,6 +135,14 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     // ─── UUPS Authorization ───
     function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
 
+    // H-4 v3: 최초 배포 시 딜레이 없이 oracleRouter 초기화 (oracleRouter == address(0) 일 때만 가능)
+    function initOracleRouter(address _router) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(oracleRouter == address(0), "Already initialized");
+        require(_router != address(0), "Zero address");
+        oracleRouter = _router;
+        emit OracleRouterUpdated(address(0), _router);
+    }
+
     // H-4 v2: 2-step oracle router change with 24h delay
     function proposeOracleRouter(address _newRouter) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(_newRouter != address(0), "Zero address");
@@ -170,7 +180,10 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         uint256 disputeWindow,
         uint256 disputeBondAmount,
         bool disputeEnabled
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    ) external {
+        if (!hasRole(DEFAULT_ADMIN_ROLE, msg.sender) && !hasRole(Roles.MARKET_ADMIN_ROLE, msg.sender)) {
+            revert Unauthorized();
+        }
         profiles[profileHash] = ArbitrationProfile({
             maxDeviationBps: maxDeviationBps,
             maxBondCap: maxBondCap,
@@ -188,7 +201,17 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     function createMarket(
         CreateMarketParams calldata params
     ) external onlyRole(Roles.MARKET_ADMIN_ROLE) returns (uint256) {
-        return _createMarketInternal(params, 0);
+        return _createMarketInternal(params, 0, 0);
+    }
+
+    /// @notice Create a market with a specific ID (for DB ID = on-chain ID alignment).
+    /// @param customId  The desired on-chain market ID (must not already exist).
+    function createMarketWithId(
+        uint256 customId,
+        CreateMarketParams calldata params
+    ) external onlyRole(Roles.MARKET_ADMIN_ROLE) returns (uint256) {
+        if (customId == 0) revert MarketNotFound(0);
+        return _createMarketInternal(params, 0, customId);
     }
 
     /// @notice Batch create markets for a single event. Per-market skip on failure.
@@ -231,7 +254,62 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
             if (skip) {
                 skipCount++;
             } else {
-                _createMarketInternal(params[i], eventId);
+                _createMarketInternal(params[i], eventId, 0);
+                successCount++;
+            }
+            unchecked { i++; }
+        }
+
+        emit MarketBatchCreated(eventId, params.length, successCount, skipCount);
+    }
+
+    /// @notice Batch create markets with specific IDs for DB alignment.
+    /// @param ids  Array of desired on-chain market IDs (must match params length).
+    function createMarketBatchWithIds(
+        uint256 eventId,
+        uint256[] calldata ids,
+        CreateMarketParams[] calldata params
+    ) external onlyRole(Roles.MARKET_ADMIN_ROLE) {
+        require(ids.length == params.length, "length_mismatch");
+        if (params.length > MAX_BATCH_MARKETS) {
+            revert TooManyBatchMarkets(params.length, MAX_BATCH_MARKETS);
+        }
+
+        uint256 successCount;
+        uint256 skipCount;
+
+        for (uint256 i = 0; i < params.length;) {
+            bool skip = false;
+            if (ids[i] == 0) {
+                emit MarketCreationSkipped(params[i].questionId, "invalid_custom_id");
+                skip = true;
+            } else if (markets[ids[i]].exists) {
+                emit MarketCreationSkipped(params[i].questionId, "market_id_taken");
+                skip = true;
+            } else if (questionIdToMarketId[params[i].questionId] != 0) {
+                emit MarketCreationSkipped(params[i].questionId, "duplicate_question");
+                skip = true;
+            } else if (params[i].tags.length > MAX_TAGS) {
+                emit MarketCreationSkipped(params[i].questionId, "too_many_tags");
+                skip = true;
+            } else if (params[i].outcomeSlotCount != 2) {
+                emit MarketCreationSkipped(params[i].questionId, "invalid_outcome_count");
+                skip = true;
+            } else if (params[i].endTime <= block.timestamp) {
+                emit MarketCreationSkipped(params[i].questionId, "invalid_end_time");
+                skip = true;
+            } else if (params[i].cutoff == 0 || params[i].cutoff > params[i].endTime || params[i].cutoff <= block.timestamp) {
+                emit MarketCreationSkipped(params[i].questionId, "invalid_cutoff");
+                skip = true;
+            } else if (!profiles[params[i].profileHash].exists) {
+                emit MarketCreationSkipped(params[i].questionId, "profile_not_found");
+                skip = true;
+            }
+
+            if (skip) {
+                skipCount++;
+            } else {
+                _createMarketInternal(params[i], eventId, ids[i]);
                 successCount++;
             }
             unchecked { i++; }
@@ -242,7 +320,8 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
 
     function _createMarketInternal(
         CreateMarketParams calldata params,
-        uint256 eventId
+        uint256 eventId,
+        uint256 customId
     ) internal returns (uint256 marketId) {
         if (questionIdToMarketId[params.questionId] != 0) {
             revert QuestionIdAlreadyUsed(params.questionId);
@@ -273,7 +352,14 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         if (cps == 0) cps = 1e18;
         require(cps == 1e18 || cps == 1e17 || cps == 1e16, "Invalid collateralPerSet");
 
-        marketId = nextMarketId++;
+        if (customId > 0) {
+            if (markets[customId].exists) revert MarketIdAlreadyUsed(customId);
+            marketId = customId;
+            // Keep nextMarketId ahead of any custom ID to avoid future collisions
+            if (customId >= nextMarketId) nextMarketId = customId + 1;
+        } else {
+            marketId = nextMarketId++;
+        }
         markets[marketId] = Market({
             questionId: params.questionId,
             conditionId: conditionId,
@@ -322,6 +408,7 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         if (!m.exists) revert MarketNotFound(marketId);
         if (m.finalized) revert MarketAlreadyFinalized(marketId);
         require(newEndTime > m.endTime, "Must extend");
+        require(newEndTime > block.timestamp, "Must be in future");
 
         m.endTime = newEndTime;
         emit MarketExtended(marketId, newEndTime);
@@ -330,6 +417,7 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     function setResolved(uint256 marketId) external onlyOracleRouter {
         Market storage m = markets[marketId];
         if (!m.exists) revert MarketNotFound(marketId);
+        if (m.finalized) revert MarketAlreadyFinalized(marketId);
         if (m.resolved) revert MarketAlreadyResolved(marketId);
 
         m.resolved = true;
@@ -404,6 +492,7 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         Market storage m = markets[marketId];
         if (!m.exists) revert MarketNotFound(marketId);
         if (m.finalized) revert MarketAlreadyFinalizedErr(marketId);
+        if (m.resolved) revert MarketAlreadyResolved(marketId);
         require(block.timestamp > m.endTime, "Market not expired yet");
 
         m.resolved = true;
@@ -450,7 +539,12 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         Market storage m = markets[marketId];
         // M-5 v2: Validate market exists
         if (!m.exists) revert MarketNotFound(marketId);
-        m.currentOI = m.currentOI > oi ? m.currentOI - oi : 0;
+        if (oi > m.currentOI) {
+            emit OIUnderflow(marketId, m.currentOI, oi);
+            m.currentOI = 0;
+        } else {
+            m.currentOI -= oi;
+        }
     }
 
     // ─── OracleRouter Integration ───
@@ -467,6 +561,14 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         emit MarketUnresolved(marketId);
     }
 
+    /// @notice Reset tradingCutoff after unresolve so the market can resume trading.
+    function resetTradingCutoff(uint256 marketId, uint256 newCutoff) external onlyOracleRouter {
+        Market storage m = markets[marketId];
+        if (!m.exists) revert MarketNotFound(marketId);
+        if (m.finalized) revert MarketAlreadyFinalized(marketId);
+        m.tradingCutoff = newCutoff;
+    }
+
     /// @notice Get dispute configuration for a market's profile.
     function getDisputeConfig(uint256 marketId) external view returns (
         bool disputeEnabled,
@@ -477,6 +579,32 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         if (!m.exists) revert MarketNotFound(marketId);
         ArbitrationProfile storage p = profiles[m.profileHash];
         return (p.disputeEnabled, p.disputeWindow, p.disputeBondAmount);
+    }
+
+    // ─── CPS Admin ───
+
+    event CollateralPerSetUpdated(uint256 indexed marketId, uint256 oldCps, uint256 newCps);
+
+    /// @notice Update collateralPerSet for an existing market.
+    function setCollateralPerSet(uint256 marketId, uint256 newCps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        Market storage m = markets[marketId];
+        if (!m.exists) revert MarketNotFound(marketId);
+        require(newCps == 1e18 || newCps == 1e17 || newCps == 1e16, "Invalid collateralPerSet");
+        uint256 oldCps = m.collateralPerSet;
+        m.collateralPerSet = newCps;
+        emit CollateralPerSetUpdated(marketId, oldCps, newCps);
+    }
+
+    /// @notice Batch update collateralPerSet for multiple markets.
+    function batchSetCollateralPerSet(uint256[] calldata marketIds, uint256 newCps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newCps == 1e18 || newCps == 1e17 || newCps == 1e16, "Invalid collateralPerSet");
+        for (uint256 i = 0; i < marketIds.length; i++) {
+            Market storage m = markets[marketIds[i]];
+            if (!m.exists) revert MarketNotFound(marketIds[i]);
+            uint256 oldCps = m.collateralPerSet;
+            m.collateralPerSet = newCps;
+            emit CollateralPerSetUpdated(marketIds[i], oldCps, newCps);
+        }
     }
 
     // ─── View ───

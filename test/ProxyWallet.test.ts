@@ -56,6 +56,7 @@ async function proxyFixture() {
     await exchange.getAddress(),
     await usdt.getAddress(),
     await ct.getAddress(),
+    deployer.address,
   );
 
   return {
@@ -228,6 +229,7 @@ describe("ProxyWallet", function () {
           { name: "value", type: "uint256" },
           { name: "dataHash", type: "bytes32" },
           { name: "nonce", type: "uint256" },
+          { name: "deadline", type: "uint256" },
         ],
       };
 
@@ -236,10 +238,11 @@ describe("ProxyWallet", function () {
         value,
         dataHash: ethers.keccak256(data),
         nonce,
+        deadline: 0,
       });
 
       // Relayer submits
-      await proxy.connect(relayer).executeOnBehalf(target, value, data, nonce, sig);
+      await proxy.connect(relayer).executeOnBehalf(target, value, data, nonce, 0, sig);
 
       expect(await usdt.balanceOf(user.address)).to.equal(ethers.parseEther("50"));
     });
@@ -274,6 +277,7 @@ describe("ProxyWallet", function () {
           { name: "value", type: "uint256" },
           { name: "dataHash", type: "bytes32" },
           { name: "nonce", type: "uint256" },
+          { name: "deadline", type: "uint256" },
         ],
       };
       const sig = await user.signTypedData(domain, types, {
@@ -281,13 +285,14 @@ describe("ProxyWallet", function () {
         value: 0,
         dataHash: ethers.keccak256(data),
         nonce,
+        deadline: 0,
       });
 
-      await proxy.connect(relayer).executeOnBehalf(target, 0, data, nonce, sig);
+      await proxy.connect(relayer).executeOnBehalf(target, 0, data, nonce, 0, sig);
 
       // Replay with same nonce
       await expect(
-        proxy.connect(relayer).executeOnBehalf(target, 0, data, nonce, sig),
+        proxy.connect(relayer).executeOnBehalf(target, 0, data, nonce, 0, sig),
       ).to.be.revertedWithCustomError(proxy, "NonceAlreadyUsed");
     });
 
@@ -320,6 +325,7 @@ describe("ProxyWallet", function () {
           { name: "value", type: "uint256" },
           { name: "dataHash", type: "bytes32" },
           { name: "nonce", type: "uint256" },
+          { name: "deadline", type: "uint256" },
         ],
       };
 
@@ -329,10 +335,130 @@ describe("ProxyWallet", function () {
         value: 0,
         dataHash: ethers.keccak256(data),
         nonce: 1,
+        deadline: 0,
       });
 
       await expect(
-        proxy.connect(relayer).executeOnBehalf(target, 0, data, 1, sig),
+        proxy.connect(relayer).executeOnBehalf(target, 0, data, 1, 0, sig),
+      ).to.be.revertedWithCustomError(proxy, "InvalidSignature");
+    });
+  });
+
+  describe("ExecuteBatchOnBehalf (meta-tx batch)", function () {
+    it("relayer can batch-execute with owner's EIP-712 ExecuteBatch signature", async function () {
+      const { factory, user, relayer, usdt } = await loadFixture(proxyFixture);
+
+      await factory.createProxy(user.address, ethers.ZeroHash);
+      const proxyAddr = await factory.proxyOf(user.address);
+      const PW = await ethers.getContractFactory("ProxyWallet");
+      const proxy = PW.attach(proxyAddr) as any;
+
+      // Mint USDT to proxy
+      await usdt.mint(proxyAddr, ethers.parseEther("100"));
+
+      const usdtAddr = await usdt.getAddress();
+
+      // Build batch: [transfer 30 to user, transfer 20 to relayer]
+      const data1 = usdt.interface.encodeFunctionData("transfer", [user.address, ethers.parseEther("30")]);
+      const data2 = usdt.interface.encodeFunctionData("transfer", [relayer.address, ethers.parseEther("20")]);
+
+      const targets = [usdtAddr, usdtAddr];
+      const values = [0n, 0n];
+      const datas = [data1, data2];
+      const nonce = BigInt(Date.now()); // Same as frontend uses
+
+      // Sign EIP-712 ExecuteBatch — match EXACTLY what the frontend does
+      const network = await ethers.provider.getNetwork();
+      const domain = {
+        name: "GameClub ProxyWallet",
+        version: "1",
+        chainId: network.chainId,
+        verifyingContract: proxyAddr,
+      };
+
+      const batchTypes = {
+        ExecuteBatch: [
+          { name: "targetsHash", type: "bytes32" },
+          { name: "valuesHash", type: "bytes32" },
+          { name: "datasHash", type: "bytes32" },
+          { name: "nonce", type: "uint256" },
+        ],
+      };
+
+      // Compute hashes the same way as frontend (useProxyWallet.ts)
+      // NOTE: Solidity abi.encodePacked(address[]) pads each address to 32 bytes
+      const targetsHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+        targets.map(() => "address"),
+        targets,
+      ));
+      const valuesHash = ethers.keccak256(ethers.solidityPacked(
+        values.map(() => "uint256"),
+        values,
+      ));
+      const dataHashes = datas.map((d: string) => ethers.keccak256(d));
+      const datasHash = ethers.keccak256(ethers.solidityPacked(
+        dataHashes.map(() => "bytes32"),
+        dataHashes,
+      ));
+
+      const sig = await user.signTypedData(domain, batchTypes, {
+        targetsHash,
+        valuesHash,
+        datasHash,
+        nonce,
+      });
+
+      // Relayer submits batch on behalf
+      await proxy.connect(relayer).executeBatchOnBehalf(targets, values, datas, nonce, sig);
+
+      expect(await usdt.balanceOf(user.address)).to.equal(ethers.parseEther("30"));
+      expect(await usdt.balanceOf(relayer.address)).to.equal(ethers.parseEther("20"));
+    });
+
+    it("batch on behalf with wrong signer reverts", async function () {
+      const { factory, user, relayer, otherUser, usdt } = await loadFixture(proxyFixture);
+
+      await factory.createProxy(user.address, ethers.ZeroHash);
+      const proxyAddr = await factory.proxyOf(user.address);
+      const PW = await ethers.getContractFactory("ProxyWallet");
+      const proxy = PW.attach(proxyAddr) as any;
+
+      await usdt.mint(proxyAddr, ethers.parseEther("100"));
+      const usdtAddr = await usdt.getAddress();
+
+      const data1 = usdt.interface.encodeFunctionData("transfer", [user.address, ethers.parseEther("10")]);
+      const targets = [usdtAddr];
+      const values = [0n];
+      const datas = [data1];
+      const nonce = 999n;
+
+      const network = await ethers.provider.getNetwork();
+      const domain = {
+        name: "GameClub ProxyWallet",
+        version: "1",
+        chainId: network.chainId,
+        verifyingContract: proxyAddr,
+      };
+      const batchTypes = {
+        ExecuteBatch: [
+          { name: "targetsHash", type: "bytes32" },
+          { name: "valuesHash", type: "bytes32" },
+          { name: "datasHash", type: "bytes32" },
+          { name: "nonce", type: "uint256" },
+        ],
+      };
+
+      const targetsHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["address"], targets));
+      const valuesHash = ethers.keccak256(ethers.solidityPacked(["uint256"], values));
+      const datasHash = ethers.keccak256(ethers.solidityPacked(["bytes32"], [ethers.keccak256(data1)]));
+
+      // Sign with otherUser (not the owner)
+      const sig = await otherUser.signTypedData(domain, batchTypes, {
+        targetsHash, valuesHash, datasHash, nonce,
+      });
+
+      await expect(
+        proxy.connect(relayer).executeBatchOnBehalf(targets, values, datas, nonce, sig),
       ).to.be.revertedWithCustomError(proxy, "InvalidSignature");
     });
   });
@@ -423,21 +549,21 @@ describe("SafeProxyFactory", function () {
     });
 
     it("reverts with zero address for implementation or exchange", async function () {
-      const { usdt, ct } = await loadFixture(proxyFixture);
+      const { usdt, ct, deployer } = await loadFixture(proxyFixture);
       const SPF = await ethers.getContractFactory("SafeProxyFactory");
 
       await expect(
-        SPF.deploy(ethers.ZeroAddress, ethers.ZeroAddress, await usdt.getAddress(), await ct.getAddress()),
+        SPF.deploy(ethers.ZeroAddress, ethers.ZeroAddress, await usdt.getAddress(), await ct.getAddress(), deployer.address),
       ).to.be.revertedWithCustomError(SPF, "ZeroAddress");
     });
 
     // Audit v2 L-1: Zero-address checks for usdt and conditionalTokens
     it("reverts with zero usdt address", async function () {
-      const { pwImpl, exchange } = await loadFixture(proxyFixture);
+      const { pwImpl, exchange, deployer } = await loadFixture(proxyFixture);
       const SPF = await ethers.getContractFactory("SafeProxyFactory");
 
       await expect(
-        SPF.deploy(await pwImpl.getAddress(), await exchange.getAddress(), ethers.ZeroAddress, ethers.ZeroAddress),
+        SPF.deploy(await pwImpl.getAddress(), await exchange.getAddress(), ethers.ZeroAddress, ethers.ZeroAddress, deployer.address),
       ).to.be.revertedWithCustomError(SPF, "ZeroAddress");
     });
   });

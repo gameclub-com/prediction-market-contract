@@ -35,6 +35,8 @@ contract CentralizedOracleRouter is
     // ─── Events (implementation-specific, beyond IOracleRouter) ───
     event EmergencyRejected(uint256 indexed marketId, address indexed rejectedBy);
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
+    event BondCredited(uint256 indexed marketId, address indexed recipient, uint256 amount);
+    event BondWithdrawn(address indexed recipient, uint256 amount);
 
     // ─── Reentrancy Guard (inline — OZ v5 removed ReentrancyGuardUpgradeable) ───
     uint256 private _reentrancyStatus;
@@ -54,6 +56,7 @@ contract CentralizedOracleRouter is
     address public treasury;
 
     mapping(uint256 => Proposal) private _proposals;
+    mapping(address => uint256) public pendingBondWithdrawals;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -115,8 +118,8 @@ contract CentralizedOracleRouter is
 
         MarketRegistry.Market memory m = marketRegistry.getMarket(marketId);
         require(
-            block.timestamp >= m.tradingCutoff || block.timestamp >= m.endTime,
-            "Market not yet ended"
+            (m.tradingCutoff > 0 && block.timestamp >= m.tradingCutoff) || block.timestamp >= m.endTime,
+            "Market not yet ended or cutoff not reached"
         );
 
         Proposal storage p = _proposals[marketId];
@@ -165,6 +168,9 @@ contract CentralizedOracleRouter is
         Proposal storage p = _proposals[marketId];
         if (p.status != ProposalStatus.PROPOSED) revert ProposalNotProposed(marketId);
         if (block.timestamp >= p.disputeDeadline) revert DisputeWindowExpired(marketId);
+
+        MarketRegistry.Market memory m = marketRegistry.getMarket(marketId);
+        require(!m.finalized, "Market already finalized");
 
         // Get bond amount from market's profile
         (,, uint256 bondAmount) = marketRegistry.getDisputeConfig(marketId);
@@ -221,16 +227,18 @@ contract CentralizedOracleRouter is
         Proposal storage p = _proposals[marketId];
         if (p.status != ProposalStatus.DISPUTED) revert ProposalNotDisputed(marketId);
 
+        uint256 originalOutcome = p.outcomeIndex;
+        p.outcomeIndex = outcomeIndex;
         p.status = ProposalStatus.FINALIZED;
 
-        // Bond disposition
+        // Bond disposition — pull-based to prevent DoS
         if (p.disputeBond > 0) {
-            if (outcomeIndex == p.outcomeIndex) {
-                // Original proposal confirmed — disputer loses bond
-                bondToken.safeTransfer(treasury, p.disputeBond);
+            if (outcomeIndex == originalOutcome) {
+                pendingBondWithdrawals[treasury] += p.disputeBond;
+                emit BondCredited(marketId, treasury, p.disputeBond);
             } else {
-                // Original proposal overturned — disputer gets bond back
-                bondToken.safeTransfer(p.disputer, p.disputeBond);
+                pendingBondWithdrawals[p.disputer] += p.disputeBond;
+                emit BondCredited(marketId, p.disputer, p.disputeBond);
             }
         }
 
@@ -252,9 +260,10 @@ contract CentralizedOracleRouter is
             revert ProposalNotFound(marketId);
         }
 
-        // Return bond to disputer if disputed
+        // Return bond to disputer if disputed — pull-based
         if (p.status == ProposalStatus.DISPUTED && p.disputeBond > 0) {
-            bondToken.safeTransfer(p.disputer, p.disputeBond);
+            pendingBondWithdrawals[p.disputer] += p.disputeBond;
+            emit BondCredited(marketId, p.disputer, p.disputeBond);
         }
 
         p.status = ProposalStatus.REJECTED;
@@ -308,9 +317,10 @@ contract CentralizedOracleRouter is
             revert ProposalAlreadyExists(marketId);
         }
 
-        // If there's an active dispute, return the bond to disputer
+        // If there's an active dispute, return the bond to disputer — pull-based
         if (p.status == ProposalStatus.DISPUTED && p.disputeBond > 0) {
-            bondToken.safeTransfer(p.disputer, p.disputeBond);
+            pendingBondWithdrawals[p.disputer] += p.disputeBond;
+            emit BondCredited(marketId, p.disputer, p.disputeBond);
         }
 
         p.status = ProposalStatus.FINALIZED;
@@ -342,11 +352,25 @@ contract CentralizedOracleRouter is
         require(m.finalized, "Market not finalized");
 
         if (p.disputeBond > 0) {
-            bondToken.safeTransfer(p.disputer, p.disputeBond);
+            pendingBondWithdrawals[p.disputer] += p.disputeBond;
+            emit BondCredited(marketId, p.disputer, p.disputeBond);
         }
         p.status = ProposalStatus.FINALIZED;
 
         emit DisputeResolved(marketId, p.outcomeIndex, msg.sender);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // BOND WITHDRAWAL
+    // ═══════════════════════════════════════════════════════
+
+    /// @notice Withdraw credited dispute bonds (pull-based pattern to prevent DoS).
+    function withdrawBond() external nonReentrant {
+        uint256 amount = pendingBondWithdrawals[msg.sender];
+        require(amount > 0, "No bond to withdraw");
+        pendingBondWithdrawals[msg.sender] = 0;
+        bondToken.safeTransfer(msg.sender, amount);
+        emit BondWithdrawn(msg.sender, amount);
     }
 
     // ═══════════════════════════════════════════════════════
@@ -361,5 +385,5 @@ contract CentralizedOracleRouter is
     }
 
     // ─── Storage Gap ───
-    uint256[48] private __gap;
+    uint256[47] private __gap;
 }

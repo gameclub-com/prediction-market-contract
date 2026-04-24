@@ -2,14 +2,15 @@
 pragma solidity 0.8.24;
 
 import "@openzeppelin/contracts-upgradeable/token/ERC1155/ERC1155Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @title ConditionalTokens — ERC1155 outcome tokens for prediction markets
-/// @notice v1: outcomeSlotCount == 2 only. Gnosis CTF-style.
-contract ConditionalTokens is Initializable, ERC1155Upgradeable, UUPSUpgradeable {
+/// @notice v2: AccessControl 기반 역할 관리. outcomeSlotCount == 2 only. Gnosis CTF-style.
+contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
     // ─── Errors ───
@@ -79,9 +80,10 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, UUPSUpgradeable
     }
 
     // ─── State ───
+    // ⚠️ Storage layout: 아래 3개 변수 순서/타입 절대 변경 금지 (기존 프록시 호환)
     IERC20 public collateralToken; // USDT (was immutable)
     address public treasury;
-    address public admin; // upgrade authority
+    address public admin; // V1 upgrade authority — V2에서 deprecated (AccessControl로 대체)
 
     // conditionId => outcome payouts
     mapping(bytes32 => uint256[]) public payoutNumerators;
@@ -112,27 +114,43 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, UUPSUpgradeable
         require(_admin != address(0), "Zero admin");
 
         __ERC1155_init("");
+        __AccessControl_init();
         _reentrancyStatus = _NOT_ENTERED;
 
         collateralToken = IERC20(_collateralToken);
         treasury = _treasury;
         admin = _admin;
+
+        // V2: AccessControl 역할 설정
+        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
     }
 
-    // ─── UUPS Authorization ───
-    function _authorizeUpgrade(address) internal override {
-        require(msg.sender == admin, "Only admin");
+    /// @notice V2 마이그레이션: 기존 배포된 프록시에서 AccessControl 활성화.
+    ///         reinitializer(2) 보장 — 한 번만 실행 가능.
+    ///         기존 admin(=deployer)이 upgradeToAndCall()로 호출.
+    /// @param _newAdmin AccessControl의 DEFAULT_ADMIN_ROLE을 받을 주소 (Timelock/Multisig)
+    function migrateToAccessControl(address _newAdmin) external reinitializer(2) {
+        require(_newAdmin != address(0), "Zero admin");
+        __AccessControl_init();
+        _grantRole(DEFAULT_ADMIN_ROLE, _newAdmin);
+        // 기존 admin 변수는 storage layout 보존을 위해 건드리지 않음.
+        // _authorizeUpgrade가 role 기반으로 변경되었으므로 admin 변수는 더 이상 사용되지 않음.
     }
 
-    // ─── L-4: Treasury setter ───
+    // ─── UUPS Authorization (V2: role 기반) ───
+    function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
 
-    function setTreasury(address _treasury) external {
-        require(msg.sender == treasury, "Only treasury");
+    // ─── Treasury setter (V2: role 기반) ───
+
+    function setTreasury(address _treasury) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(_treasury != address(0), "Zero address");
         address old = treasury;
         treasury = _treasury;
         emit TreasuryUpdated(old, _treasury);
     }
+
+    // ─── sweepZeroSupply (V2: role 기반) ───
+    // treasury → DEFAULT_ADMIN_ROLE로 변경하여 Timelock이 관리 가능
 
     // ─── Condition Management ───
 
@@ -164,6 +182,7 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, UUPSUpgradeable
     ) external {
         if (amount == 0) revert ZeroAmount();
         if (conditionOutcomeSlotCounts[conditionId] == 0) revert ConditionNotFound(conditionId);
+        if (isResolved[conditionId]) revert ConditionAlreadyResolved(conditionId);
 
         collateralToken.safeTransferFrom(msg.sender, address(this), amount);
 
@@ -232,6 +251,7 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, UUPSUpgradeable
             den += payouts[i];
             unchecked { i++; }
         }
+        require(den > 0, "Zero payout denominator");
         payoutDenominator[conditionId] = den;
 
         emit ConditionResolved(conditionId, msg.sender, questionId, payouts);
@@ -309,8 +329,7 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, UUPSUpgradeable
         bytes32 conditionId,
         uint256 indexSet,
         uint256 collateralAmount
-    ) external {
-        require(msg.sender == treasury, "Only treasury");
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (!isResolved[conditionId]) revert ConditionNotResolved(conditionId);
 
         uint256 den = payoutDenominator[conditionId];
@@ -400,6 +419,13 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, UUPSUpgradeable
         }
     }
 
+    // ─── ERC165: resolve multiple inheritance ───
+    function supportsInterface(bytes4 interfaceId)
+    public view override(ERC1155Upgradeable, AccessControlUpgradeable) returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+
     // ─── Storage Gap ───
-    uint256[48] private __gap;
+    uint256[47] private __gap;
 }

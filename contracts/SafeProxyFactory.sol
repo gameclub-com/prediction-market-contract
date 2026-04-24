@@ -17,6 +17,7 @@ contract SafeProxyFactory {
     // ─── State ───
     address public immutable implementation;
     address public immutable exchange;
+    address public immutable deployer;
     IERC20 public immutable usdt;
     ConditionalTokens public immutable conditionalTokens;
 
@@ -28,17 +29,20 @@ contract SafeProxyFactory {
     // ─── Errors ───
     error ProxyAlreadyExists(address owner, address existing);
     error ZeroAddress();
+    error Unauthorized();
 
     constructor(
         address _implementation,
         address _exchange,
         address _usdt,
-        address _conditionalTokens
+        address _conditionalTokens,
+        address _deployer
     ) {
         // L-1 v2: Zero-address checks for all params
-        if (_implementation == address(0) || _exchange == address(0) || _usdt == address(0) || _conditionalTokens == address(0)) revert ZeroAddress();
+        if (_implementation == address(0) || _exchange == address(0) || _usdt == address(0) || _conditionalTokens == address(0) || _deployer == address(0)) revert ZeroAddress();
         implementation = _implementation;
         exchange = _exchange;
+        deployer = _deployer;
         usdt = IERC20(_usdt);
         conditionalTokens = ConditionalTokens(_conditionalTokens);
     }
@@ -48,6 +52,7 @@ contract SafeProxyFactory {
     /// @param salt Additional salt for address derivation (use 0 for default).
     /// @return proxy The deployed proxy wallet address.
     function createProxy(address owner, bytes32 salt) external returns (address proxy) {
+        if (msg.sender != owner && msg.sender != deployer) revert Unauthorized();
         if (owner == address(0)) revert ZeroAddress();
         if (proxyOf[owner] != address(0)) revert ProxyAlreadyExists(owner, proxyOf[owner]);
 

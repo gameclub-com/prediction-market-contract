@@ -158,7 +158,7 @@ describe("Admin UI proposeOutcomeBatch — Reproduction", function () {
       // 시간 안 넘김 — cutoff 이전
       await expect(
         router.connect(adminWallet).proposeOutcomeBatch([1], [0]),
-      ).to.be.revertedWith("Market not yet ended");
+      ).to.be.revertedWith("Market not yet ended or cutoff not reached");
     });
   });
 

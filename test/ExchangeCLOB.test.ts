@@ -151,6 +151,9 @@ async function deployFixture() {
     feeCollector.address, treasury.address
   ], { kind: 'uups', initializer: 'initialize' });
 
+  // ── V2: Set infinite USDT approval to ConditionalTokens ──
+  await exchange.initializeV2();
+
   // ── Grant roles on ExchangeCLOB ──
   await exchange.grantRole(RELAYER_ROLE, relayer.address);
   await exchange.grantRole(PAUSER_ROLE, pauser.address);
@@ -978,7 +981,7 @@ describe("ExchangeCLOB", function () {
       ];
 
       const tx = await exchange.connect(relayer).settleBatch(1, fills);
-      // Should be skipped with "max_oi_exceeded"
+      // V3: MINT through settleBatch is skipped with "mint_use_sweep"
       await expect(tx).to.emit(exchange, "FillSkipped");
       await expect(tx)
         .to.emit(exchange, "BatchSettled")
@@ -2077,12 +2080,12 @@ describe("ExchangeCLOB", function () {
   // HIGH-2: sweepZeroSupply access control
   // ────────────────────────────────────────────────────────────
   describe("HIGH-2. sweepZeroSupply access control", function () {
-    it("non-treasury caller => revert", async function () {
+    it("non-admin caller => revert", async function () {
       const { ct, alice, conditionId } = await loadFixture(deployFixture);
 
       await expect(
         ct.connect(alice).sweepZeroSupply(conditionId, 1, ethers.parseEther("100"))
-      ).to.be.revertedWith("Only treasury");
+      ).to.be.reverted; // AccessControl revert
     });
   });
 
@@ -2394,9 +2397,9 @@ describe("ExchangeCLOB", function () {
   // ────────────────────────────────────────────────────────────
   // HIGH-2 Extended: sweepZeroSupply access control
   // ────────────────────────────────────────────────────────────
-  describe("HIGH-2 Extended. sweepZeroSupply treasury can call", function () {
-    it("treasury can sweep zero-supply position", async function () {
-      const { ct, registry, oracle, treasury, usdt, conditionId, marketId } =
+  describe("HIGH-2 Extended. sweepZeroSupply admin can call", function () {
+    it("admin can sweep zero-supply position", async function () {
+      const { ct, registry, oracle, deployer, usdt, conditionId, marketId } =
         await loadFixture(deployFixture);
 
       // Resolve market so condition is resolved
@@ -2406,19 +2409,19 @@ describe("ExchangeCLOB", function () {
 
       // Outcome 1 (loser) — check if anyone holds it
       // In fixture, alice and bob both have shares. Not zero supply.
-      // This test just verifies the access control works for treasury caller.
+      // This test just verifies the access control works for admin caller.
       // We skip the actual sweep since totalSupply != 0 in fixture.
       const posId1Coll = await ct.getCollectionId(conditionId, 2);
       const posId1 = await ct.getPositionId(await usdt.getAddress(), posId1Coll);
       const supply = await ct.totalSupply(posId1);
 
       if (supply === 0n) {
-        // Would succeed for treasury
-        await ct.connect(treasury).sweepZeroSupply(conditionId, 2, 0n);
+        // Would succeed for admin (deployer has DEFAULT_ADMIN_ROLE)
+        await ct.connect(deployer).sweepZeroSupply(conditionId, 2, 0n);
       } else {
         // C-1 v2: Winning outcome still has supply — sweep blocked
         await expect(
-          ct.connect(treasury).sweepZeroSupply(conditionId, 2, ethers.parseEther("100"))
+          ct.connect(deployer).sweepZeroSupply(conditionId, 2, ethers.parseEther("100"))
         ).to.be.revertedWith("Winning outcome has outstanding supply");
       }
     });
@@ -2679,12 +2682,12 @@ describe("ExchangeCLOB", function () {
       const aliceSharesBefore = await ct.balanceOf(alice.address, posId0);
       const bobSharesBefore = await ct.balanceOf(bob.address, posId1);
 
-      const tx = await exchange.connect(relayer).settleBatch(1, [{
-        makerOrder, takerOrder, makerSig, takerSig,
-        fillAmount,
-        fee: 0n,
-        matchType: 1, // MINT
-      }]);
+      // V3: MINT fills use settleMintSweep
+      const tx = await exchange.connect(relayer).settleMintSweep(1, {
+        takerOrder, takerSig,
+        makerOrders: [makerOrder], makerSigs: [makerSig],
+        fillAmounts: [fillAmount], fees: [0n],
+      });
 
       await expect(tx).to.emit(exchange, "FillExecuted");
 
@@ -3136,13 +3139,12 @@ describe("ExchangeCLOB", function () {
       const makerSig = await signOrder(charlie, makerOrder, exchangeAddr);
       const takerSig = await signOrder(dave, takerOrder, exchangeAddr);
 
-      // MINT fill: 200 shares
-      await exchange.connect(relayer).settleBatch(1, [{
-        makerOrder, takerOrder, makerSig, takerSig,
-        fillAmount: ethers.parseEther("200"),
-        fee: 0n,
-        matchType: 1, // MINT
-      }]);
+      // V3: MINT fill via settleMintSweep: 200 shares
+      await exchange.connect(relayer).settleMintSweep(1, {
+        takerOrder, takerSig,
+        makerOrders: [makerOrder], makerSigs: [makerSig],
+        fillAmounts: [ethers.parseEther("200")], fees: [0n],
+      });
 
       // Verify shares credited to wallets
       expect(await ct.balanceOf(charlie.address, posId0))
@@ -3304,12 +3306,12 @@ describe("ExchangeCLOB", function () {
       const fee = ethers.parseEther("1"); // 1 USDT fee
       const fcBefore = await usdt.balanceOf(feeCollector.address);
 
-      await exchange.connect(relayer).settleBatch(1, [{
-        makerOrder, takerOrder, makerSig, takerSig,
-        fillAmount: ethers.parseEther("100"),
-        fee,
-        matchType: 1,
-      }]);
+      // V3: MINT via settleMintSweep
+      await exchange.connect(relayer).settleMintSweep(1, {
+        takerOrder, takerSig,
+        makerOrders: [makerOrder], makerSigs: [makerSig],
+        fillAmounts: [ethers.parseEther("100")], fees: [fee],
+      });
 
       const fcAfter = await usdt.balanceOf(feeCollector.address);
       expect(fcAfter - fcBefore).to.equal(fee);
@@ -3325,7 +3327,7 @@ describe("ExchangeCLOB", function () {
   // ────────────────────────────────────────────────────────────
   describe("Audit C-1. sweepZeroSupply collateral accounting", function () {
     it("sweep cannot exceed condition's own collateral", async function () {
-      const { ct, usdt, oracle, treasury } = await loadFixture(deployFixture);
+      const { ct, usdt, oracle, deployer, treasury } = await loadFixture(deployFixture);
       const ctAddr = await ct.getAddress();
 
       // Prepare condition and split 100 USDT
@@ -3341,21 +3343,21 @@ describe("ExchangeCLOB", function () {
       // Verify conditionCollateral tracked
       expect(await ct.conditionCollateral(cid)).to.equal(splitAmt);
 
-      // Burn all shares (transfer to zero via merge to get USDT back, then condition has 0 collateral)
-      // Actually, let's merge to get collateral back, then conditionCollateral = 0
+      // Merge to get collateral back, then conditionCollateral = 0
       await ct.connect(treasury).mergePositions(cid, splitAmt);
       expect(await ct.conditionCollateral(cid)).to.equal(0n);
 
       // Now resolve and try to sweep — should fail since collateral is 0
       await ct.connect(oracle).reportPayouts(qid, [1, 0]);
 
+      // deployer has DEFAULT_ADMIN_ROLE (sweepZeroSupply requires it)
       await expect(
-        ct.connect(treasury).sweepZeroSupply(cid, 1, ethers.parseEther("1"))
+        ct.connect(deployer).sweepZeroSupply(cid, 1, ethers.parseEther("1"))
       ).to.be.revertedWith("Exceeds condition collateral");
     });
 
     it("sweep of one condition doesn't affect another", async function () {
-      const { ct, usdt, oracle, treasury } = await loadFixture(deployFixture);
+      const { ct, usdt, oracle, deployer, treasury } = await loadFixture(deployFixture);
       const ctAddr = await ct.getAddress();
 
       // Create two conditions
@@ -3401,7 +3403,7 @@ describe("ExchangeCLOB", function () {
       // Try to sweep cid1 with more than its remaining collateral
       if (cid1Collateral > 0n) {
         await expect(
-          ct.connect(treasury).sweepZeroSupply(cid1, 1, cid1Collateral + 1n)
+          ct.connect(deployer).sweepZeroSupply(cid1, 1, cid1Collateral + 1n)
         ).to.be.revertedWith("Exceeds condition collateral");
       }
     });
@@ -3510,12 +3512,12 @@ describe("ExchangeCLOB", function () {
       const aliceBefore = await usdt.balanceOf(alice.address);
       const bobBefore = await usdt.balanceOf(bob.address);
 
-      await exchange.connect(relayer).settleBatch(1, [{
-        makerOrder, takerOrder, makerSig, takerSig,
-        fillAmount,
-        fee,
-        matchType: 1, // MINT
-      }]);
+      // V3: MINT via settleMintSweep
+      await exchange.connect(relayer).settleMintSweep(1, {
+        takerOrder, takerSig,
+        makerOrders: [makerOrder], makerSigs: [makerSig],
+        fillAmounts: [fillAmount], fees: [fee],
+      });
 
       const fcAfter = await usdt.balanceOf(feeCollector.address);
       const treasuryAfter = await usdt.balanceOf(treasury.address);
@@ -3568,12 +3570,12 @@ describe("ExchangeCLOB", function () {
 
       const treasuryBefore = await usdt.balanceOf(treasury.address);
 
-      await exchange.connect(relayer).settleBatch(1, [{
-        makerOrder, takerOrder, makerSig, takerSig,
-        fillAmount: ethers.parseEther("50"),
-        fee: 0n,
-        matchType: 1, // MINT
-      }]);
+      // V3: MINT via settleMintSweep
+      await exchange.connect(relayer).settleMintSweep(1, {
+        takerOrder, takerSig,
+        makerOrders: [makerOrder], makerSigs: [makerSig],
+        fillAmounts: [ethers.parseEther("50")], fees: [0n],
+      });
 
       const treasuryAfter = await usdt.balanceOf(treasury.address);
       // No surplus — treasury balance unchanged
@@ -3767,6 +3769,9 @@ describe("ExchangeCLOB", function () {
         treasury.address,
       ], { kind: 'uups', initializer: 'initialize' });
 
+      // V2: Set infinite USDT approval to ConditionalTokens
+      await exchange.initializeV2();
+
       const exchangeAddr = await exchange.getAddress();
       const ctAddr = await ct.getAddress();
 
@@ -3852,13 +3857,12 @@ describe("ExchangeCLOB", function () {
       // Now enable rejection — only transfer() fails, transferFrom() still works
       await rejectUsdt.setRejectTransfers(true);
 
-      const tx = await exchange.connect(relayer).settleBatch(1, [{
-        makerOrder: mintMaker, takerOrder: mintTaker,
-        makerSig: mintMakerSig, takerSig: mintTakerSig,
-        fillAmount: ethers.parseEther("100"),
-        fee,
-        matchType: 1, // MINT — uses _collectFee internally (transfer, not transferFrom)
-      }]);
+      // V3: MINT via settleMintSweep — uses _collectFee internally (transfer, not transferFrom)
+      const tx = await exchange.connect(relayer).settleMintSweep(1, {
+        takerOrder: mintTaker, takerSig: mintTakerSig,
+        makerOrders: [mintMaker], makerSigs: [mintMakerSig],
+        fillAmounts: [ethers.parseEther("100")], fees: [fee],
+      });
 
       // Fill should still succeed — fee goes to unclaimedFees instead of feeCollector
       await expect(tx).to.emit(exchange, "FillExecuted");
@@ -3957,13 +3961,12 @@ describe("ExchangeCLOB", function () {
       const mintMakerSig = await signOrder(alice, mintMaker, exchangeAddr);
       const mintTakerSig = await signOrder(bob, mintTaker, exchangeAddr);
 
-      await exchange.connect(relayer).settleBatch(1, [{
-        makerOrder: mintMaker, takerOrder: mintTaker,
-        makerSig: mintMakerSig, takerSig: mintTakerSig,
-        fillAmount: ethers.parseEther("50"),
-        fee: 0n,
-        matchType: 1, // MINT
-      }]);
+      // V3: MINT via settleMintSweep
+      await exchange.connect(relayer).settleMintSweep(1, {
+        takerOrder: mintTaker, takerSig: mintTakerSig,
+        makerOrders: [mintMaker], makerSigs: [mintMakerSig],
+        fillAmounts: [ethers.parseEther("50")], fees: [0n],
+      });
 
       const oiAfterMint = (await registry.getMarket(marketId)).currentOI;
       expect(oiAfterMint).to.be.gt(0n);
@@ -4066,7 +4069,7 @@ describe("ExchangeCLOB", function () {
       }]);
       await expect(tx1).to.emit(exchange, "FillExecuted"); // COMPLEMENTARY succeeds
 
-      // MINT fill of 10 (> maxOI of 5) — should be BLOCKED
+      // V3: MINT fill of 10 (> maxOI of 5) — should be BLOCKED via settleMintSweep
       const mintMaker = makeOrder({
         maker: alice.address, marketId: BigInt(mktId), outcomeIndex: BigInt(0),
         side: 0, amount: ethers.parseEther("10"), price: ethers.parseEther("0.50"),
@@ -4081,12 +4084,13 @@ describe("ExchangeCLOB", function () {
       const mintMakerSig = await signOrder(alice, mintMaker, exchangeAddr);
       const mintTakerSig = await signOrder(bob, mintTaker, exchangeAddr);
 
-      const tx2 = await exchange.connect(relayer).settleBatch(2, [{
-        makerOrder: mintMaker, takerOrder: mintTaker,
-        makerSig: mintMakerSig, takerSig: mintTakerSig,
-        fillAmount: ethers.parseEther("10"), fee: 0n, matchType: 1,
-      }]);
-      await expect(tx2).to.emit(exchange, "FillSkipped"); // MINT blocked by OI
+      await expect(
+        exchange.connect(relayer).settleMintSweep(2, {
+          takerOrder: mintTaker, takerSig: mintTakerSig,
+          makerOrders: [mintMaker], makerSigs: [mintMakerSig],
+          fillAmounts: [ethers.parseEther("10")], fees: [0n],
+        })
+      ).to.be.revertedWith("sw:oi"); // MINT blocked by OI via settleMintSweep
     });
   });
 
@@ -4281,7 +4285,7 @@ describe("ExchangeCLOB", function () {
   // AUDIT: Multiple fills in single batch
   // ────────────────────────────────────────────────────────────
   describe("AUDIT: Multi-fill batch with mixed match types", function () {
-    it("COMPLEMENTARY + MINT in same batch both succeed", async function () {
+    it("V3: COMPLEMENTARY via settleBatch + MINT via settleMintSweep both succeed", async function () {
       const { exchange, relayer, alice, bob, charlie, dave, ct, usdt, marketId, conditionId, posId0, posId1 } =
         await loadFixture(deployFixture);
       const exchangeAddr = await exchange.getAddress();
@@ -4311,7 +4315,6 @@ describe("ExchangeCLOB", function () {
       });
 
       // Fill 2: MINT (charlie BUY outcome-0 + dave BUY outcome-1 => mint)
-      // First, set up charlie and dave with USDT and approvals
       await usdt.connect(charlie).approve(ctAddr, ethers.parseEther("10000"));
       await ct.connect(charlie).setApprovalForAll(exchangeAddr, true);
       await usdt.connect(dave).approve(ctAddr, ethers.parseEther("10000"));
@@ -4343,29 +4346,21 @@ describe("ExchangeCLOB", function () {
       const mintMakerSig = await signOrder(charlie, mintMaker, exchangeAddr);
       const mintTakerSig = await signOrder(dave, mintTaker, exchangeAddr);
 
-      const tx = await exchange.connect(relayer).settleBatch(20001, [
-        {
-          makerOrder: compMaker,
-          takerOrder: compTaker,
-          makerSig: compMakerSig,
-          takerSig: compTakerSig,
-          fillAmount: ethers.parseEther("10"),
-          fee: 0n,
-          matchType: 0, // COMPLEMENTARY
-        },
-        {
-          makerOrder: mintMaker,
-          takerOrder: mintTaker,
-          makerSig: mintMakerSig,
-          takerSig: mintTakerSig,
-          fillAmount: ethers.parseEther("10"),
-          fee: 0n,
-          matchType: 1, // MINT
-        },
-      ]);
+      // V3: COMPLEMENTARY goes through settleBatch
+      const tx1 = await exchange.connect(relayer).settleBatch(20001, [{
+        makerOrder: compMaker, takerOrder: compTaker,
+        makerSig: compMakerSig, takerSig: compTakerSig,
+        fillAmount: ethers.parseEther("10"), fee: 0n, matchType: 0,
+      }]);
+      await expect(tx1).to.emit(exchange, "BatchSettled").withArgs(20001, 1, 0, relayer.address);
 
-      // Both should emit FillExecuted
-      await expect(tx).to.emit(exchange, "BatchSettled").withArgs(20001, 2, 0, relayer.address);
+      // V3: MINT goes through settleMintSweep
+      const tx2 = await exchange.connect(relayer).settleMintSweep(20002, {
+        takerOrder: mintTaker, takerSig: mintTakerSig,
+        makerOrders: [mintMaker], makerSigs: [mintMakerSig],
+        fillAmounts: [ethers.parseEther("10")], fees: [0n],
+      });
+      await expect(tx2).to.emit(exchange, "BatchSettled").withArgs(20002, 1, 0, relayer.address);
     });
   });
 
@@ -4633,7 +4628,7 @@ describe("ExchangeCLOB", function () {
   // ── C-1: sweepZeroSupply — all winning outcomes must have zero supply ──
   describe("Audit v2 C-1. sweepZeroSupply full redemption gate", function () {
     it("sweep succeeds only when all winning outcomes are fully redeemed", async function () {
-      const { ct, usdt, oracle, treasury } = await loadFixture(deployFixture);
+      const { ct, usdt, oracle, deployer, treasury } = await loadFixture(deployFixture);
       const ctAddr = await ct.getAddress();
 
       const qid = ethers.keccak256(ethers.toUtf8Bytes("c1-full-redeem"));
@@ -4660,12 +4655,12 @@ describe("ExchangeCLOB", function () {
       // Any remaining collateral from rounding can be swept
       const remaining = await ct.conditionCollateral(cid);
       if (remaining > 0n) {
-        await ct.connect(treasury).sweepZeroSupply(cid, 2, remaining);
+        await ct.connect(deployer).sweepZeroSupply(cid, 2, remaining);
       }
     });
 
     it("INVALID [1,1] scenario — sweep blocked until both YES and NO redeemed", async function () {
-      const { ct, usdt, oracle, treasury, alice } = await loadFixture(deployFixture);
+      const { ct, usdt, oracle, deployer, treasury, alice } = await loadFixture(deployFixture);
       const ctAddr = await ct.getAddress();
 
       const qid = ethers.keccak256(ethers.toUtf8Bytes("c1-invalid-sweep"));
@@ -4690,7 +4685,7 @@ describe("ExchangeCLOB", function () {
 
       // Try to sweep — should fail because YES tokens (outcome 0) still have outstanding supply
       await expect(
-        ct.connect(treasury).sweepZeroSupply(cid, 2, 1n)
+        ct.connect(deployer).sweepZeroSupply(cid, 2, 1n)
       ).to.be.revertedWith("Winning outcome has outstanding supply");
 
       // Alice redeems YES tokens
@@ -4699,7 +4694,7 @@ describe("ExchangeCLOB", function () {
       // Now both winning outcomes have zero supply — sweep should work (if any collateral remains)
       const remaining = await ct.conditionCollateral(cid);
       if (remaining > 0n) {
-        await ct.connect(treasury).sweepZeroSupply(cid, 1, remaining);
+        await ct.connect(deployer).sweepZeroSupply(cid, 1, remaining);
       }
     });
   });
@@ -5198,6 +5193,280 @@ describe("ExchangeCLOB", function () {
       await expect(registry.connect(safetyCouncil).unfreezeMarket(marketId))
         .to.emit(registry, "MarketFreezeToggled")
         .withArgs(marketId, false, safetyCouncil.address);
+    });
+  });
+
+  // ════════════════════════════════════════════════════════════════
+  // V3: settleMintSweep — Aggregated MINT Settlement
+  // ════════════════════════════════════════════════════════════════
+
+  describe("V3: settleMintSweep", function () {
+    it("multi-maker sweep: 3 makers in single splitPosition", async function () {
+      const { exchange, relayer, alice, bob, charlie, dave, eve, usdt, ct, marketId, conditionId, posId0, posId1 } =
+        await loadFixture(deployFixture);
+      const exchangeAddr = await exchange.getAddress();
+      const deadline = BigInt((await time.latest()) + 86400);
+
+      // Taker: eve BUY outcome-1
+      const takerOrder = makeOrder({
+        maker: eve.address, marketId: BigInt(marketId), outcomeIndex: BigInt(1),
+        side: 0, amount: ethers.parseEther("300"), price: ethers.parseEther("0.40"),
+        nonce: BigInt(1), deadline, salt: BigInt(90001),
+      });
+      const takerSig = await signOrder(eve, takerOrder, exchangeAddr);
+
+      // Makers: alice, bob, charlie all BUY outcome-0
+      const makers = [alice, bob, charlie];
+      const makerOrders = [];
+      const makerSigs = [];
+      const fillAmounts = [];
+      const fees = [];
+
+      for (let i = 0; i < makers.length; i++) {
+        const order = makeOrder({
+          maker: makers[i].address, marketId: BigInt(marketId), outcomeIndex: BigInt(0),
+          side: 0, amount: ethers.parseEther("100"), price: ethers.parseEther("0.60"),
+          nonce: BigInt(1), deadline, salt: BigInt(90010 + i),
+        });
+        makerOrders.push(order);
+        makerSigs.push(await signOrder(makers[i], order, exchangeAddr));
+        fillAmounts.push(ethers.parseEther("100"));
+        fees.push(0n);
+      }
+
+      const eveUsdtBefore = await usdt.balanceOf(eve.address);
+      const aliceUsdtBefore = await usdt.balanceOf(alice.address);
+
+      const tx = await exchange.connect(relayer).settleMintSweep(1, {
+        takerOrder, takerSig, makerOrders, makerSigs, fillAmounts, fees,
+      });
+
+      // 3 individual FillExecuted events (one per maker)
+      await expect(tx).to.emit(exchange, "FillExecuted");
+      await expect(tx).to.emit(exchange, "BatchSettled").withArgs(1, 3, 0, relayer.address);
+
+      // Taker (eve) pays: (1.0 - 0.60) * 100 * 3 = 120 USDT
+      const eveUsdtAfter = await usdt.balanceOf(eve.address);
+      expect(eveUsdtBefore - eveUsdtAfter).to.equal(ethers.parseEther("120"));
+
+      // Each maker pays: 0.60 * 100 = 60 USDT
+      const aliceUsdtAfter = await usdt.balanceOf(alice.address);
+      expect(aliceUsdtBefore - aliceUsdtAfter).to.equal(ethers.parseEther("60"));
+
+      // Taker gets outcome-1 shares: 300 total
+      expect(await ct.balanceOf(eve.address, posId1)).to.equal(ethers.parseEther("300"));
+
+      // Each maker gets outcome-0 shares: 100 each
+      expect(await ct.balanceOf(alice.address, posId0)).to.equal(
+        ethers.parseEther("5000") + ethers.parseEther("100") // fixture + sweep
+      );
+    });
+
+    it("SweepEmpty reverts", async function () {
+      const { exchange, relayer, eve } = await loadFixture(deployFixture);
+      const exchangeAddr = await exchange.getAddress();
+      const deadline = BigInt((await time.latest()) + 86400);
+
+      const takerOrder = makeOrder({
+        maker: eve.address, outcomeIndex: BigInt(1), side: 0,
+        nonce: BigInt(1), deadline, salt: BigInt(91001),
+      });
+      const takerSig = await signOrder(eve, takerOrder, exchangeAddr);
+
+      await expect(
+        exchange.connect(relayer).settleMintSweep(1, {
+          takerOrder, takerSig, makerOrders: [], makerSigs: [], fillAmounts: [], fees: [],
+        })
+      ).to.be.revertedWithCustomError(exchange, "SweepEmpty");
+    });
+
+    it("SweepLengthMismatch reverts", async function () {
+      const { exchange, relayer, alice, eve } = await loadFixture(deployFixture);
+      const exchangeAddr = await exchange.getAddress();
+      const deadline = BigInt((await time.latest()) + 86400);
+
+      const takerOrder = makeOrder({
+        maker: eve.address, outcomeIndex: BigInt(1), side: 0,
+        nonce: BigInt(1), deadline, salt: BigInt(91101),
+      });
+      const makerOrder = makeOrder({
+        maker: alice.address, outcomeIndex: BigInt(0), side: 0,
+        nonce: BigInt(1), deadline, salt: BigInt(91102),
+      });
+      const takerSig = await signOrder(eve, takerOrder, exchangeAddr);
+      const makerSig = await signOrder(alice, makerOrder, exchangeAddr);
+
+      await expect(
+        exchange.connect(relayer).settleMintSweep(1, {
+          takerOrder, takerSig,
+          makerOrders: [makerOrder], makerSigs: [makerSig],
+          fillAmounts: [ethers.parseEther("10")], fees: [], // mismatched length
+        })
+      ).to.be.revertedWithCustomError(exchange, "SweepLengthMismatch");
+    });
+
+    it("duplicate batchId reverts", async function () {
+      const { exchange, relayer, alice, bob } = await loadFixture(deployFixture);
+      const exchangeAddr = await exchange.getAddress();
+      const deadline = BigInt((await time.latest()) + 86400);
+
+      const takerOrder = makeOrder({
+        maker: bob.address, outcomeIndex: BigInt(1), side: 0,
+        amount: ethers.parseEther("100"), price: ethers.parseEther("0.40"),
+        nonce: BigInt(1), deadline, salt: BigInt(91201),
+      });
+      const makerOrder = makeOrder({
+        maker: alice.address, outcomeIndex: BigInt(0), side: 0,
+        amount: ethers.parseEther("100"), price: ethers.parseEther("0.60"),
+        nonce: BigInt(1), deadline, salt: BigInt(91202),
+      });
+      const takerSig = await signOrder(bob, takerOrder, exchangeAddr);
+      const makerSig = await signOrder(alice, makerOrder, exchangeAddr);
+
+      const sweep = {
+        takerOrder, takerSig,
+        makerOrders: [makerOrder], makerSigs: [makerSig],
+        fillAmounts: [ethers.parseEther("10")], fees: [0n],
+      };
+
+      await exchange.connect(relayer).settleMintSweep(999, sweep);
+
+      await expect(
+        exchange.connect(relayer).settleMintSweep(999, {
+          ...sweep,
+          makerOrders: [makeOrder({ maker: alice.address, outcomeIndex: BigInt(0), side: 0, nonce: BigInt(2), deadline, salt: BigInt(91203) })],
+          makerSigs: [await signOrder(alice, makeOrder({ maker: alice.address, outcomeIndex: BigInt(0), side: 0, nonce: BigInt(2), deadline, salt: BigInt(91203) }), exchangeAddr)],
+        })
+      ).to.be.revertedWithCustomError(exchange, "BatchAlreadyProcessed");
+    });
+
+    it("price sum below CPS reverts", async function () {
+      const { exchange, relayer, alice, bob } = await loadFixture(deployFixture);
+      const exchangeAddr = await exchange.getAddress();
+      const deadline = BigInt((await time.latest()) + 86400);
+
+      // alice@0.30 + bob@0.30 = 0.60 < CPS=1.0
+      const makerOrder = makeOrder({
+        maker: alice.address, outcomeIndex: BigInt(0), side: 0,
+        price: ethers.parseEther("0.30"), nonce: BigInt(1), deadline, salt: BigInt(91301),
+      });
+      const takerOrder = makeOrder({
+        maker: bob.address, outcomeIndex: BigInt(1), side: 0,
+        price: ethers.parseEther("0.30"), nonce: BigInt(1), deadline, salt: BigInt(91302),
+      });
+      const makerSig = await signOrder(alice, makerOrder, exchangeAddr);
+      const takerSig = await signOrder(bob, takerOrder, exchangeAddr);
+
+      await expect(
+        exchange.connect(relayer).settleMintSweep(1, {
+          takerOrder, takerSig,
+          makerOrders: [makerOrder], makerSigs: [makerSig],
+          fillAmounts: [ethers.parseEther("10")], fees: [0n],
+        })
+      ).to.be.revertedWith("sw:price_sum");
+    });
+
+    it("RELAYER_ROLE required", async function () {
+      const { exchange, alice, bob } = await loadFixture(deployFixture);
+      const exchangeAddr = await exchange.getAddress();
+      const deadline = BigInt((await time.latest()) + 86400);
+
+      const makerOrder = makeOrder({
+        maker: alice.address, outcomeIndex: BigInt(0), side: 0,
+        nonce: BigInt(1), deadline, salt: BigInt(91401),
+      });
+      const takerOrder = makeOrder({
+        maker: bob.address, outcomeIndex: BigInt(1), side: 0,
+        nonce: BigInt(1), deadline, salt: BigInt(91402),
+      });
+      const makerSig = await signOrder(alice, makerOrder, exchangeAddr);
+      const takerSig = await signOrder(bob, takerOrder, exchangeAddr);
+
+      await expect(
+        exchange.connect(alice).settleMintSweep(1, {
+          takerOrder, takerSig,
+          makerOrders: [makerOrder], makerSigs: [makerSig],
+          fillAmounts: [ethers.parseEther("10")], fees: [0n],
+        })
+      ).to.be.reverted; // AccessControl revert
+    });
+
+    it("sweep works with custom CPS (0.1 USDT per set)", async function () {
+      const { exchange, registry, relayer, alice, bob, usdt, ct, conditionId, marketId, posId0, posId1 } =
+        await loadFixture(deployFixture);
+      const exchangeAddr = await exchange.getAddress();
+      const deadline = BigInt((await time.latest()) + 86400);
+
+      // Set CPS to 0.1 USDT per set
+      const cps = ethers.parseEther("0.1");
+      await registry.setCollateralPerSet(marketId, cps);
+      expect(await registry.getCollateralPerSet(marketId)).to.equal(cps);
+
+      // Alice: BUY Yes@0.047, Bob: BUY No@0.060 (sum 0.107 >= 0.1 CPS)
+      const makerOrder = makeOrder({
+        maker: alice.address, marketId: BigInt(marketId), outcomeIndex: BigInt(0), side: 0,
+        amount: ethers.parseEther("100"), price: ethers.parseEther("0.047"),
+        nonce: BigInt(1), deadline, salt: BigInt(92001),
+      });
+      const takerOrder = makeOrder({
+        maker: bob.address, marketId: BigInt(marketId), outcomeIndex: BigInt(1), side: 0,
+        amount: ethers.parseEther("100"), price: ethers.parseEther("0.060"),
+        nonce: BigInt(1), deadline, salt: BigInt(92002),
+      });
+      const makerSig = await signOrder(alice, makerOrder, exchangeAddr);
+      const takerSig = await signOrder(bob, takerOrder, exchangeAddr);
+
+      const fillAmount = ethers.parseEther("100");
+      const col = (fillAmount * cps) / ethers.parseEther("1"); // 10 USDT
+      const mkCost = (ethers.parseEther("0.047") * fillAmount) / ethers.parseEther("1"); // 4.7 USDT
+
+      const aliceUsdtBefore = await usdt.balanceOf(alice.address);
+      const bobUsdtBefore = await usdt.balanceOf(bob.address);
+
+      const tx = await exchange.connect(relayer).settleMintSweep(1, {
+        takerOrder, takerSig,
+        makerOrders: [makerOrder], makerSigs: [makerSig],
+        fillAmounts: [fillAmount], fees: [0n],
+      });
+      await expect(tx).to.emit(exchange, "FillExecuted");
+
+      // Maker pays mkCost = 4.7 USDT
+      expect(aliceUsdtBefore - (await usdt.balanceOf(alice.address))).to.equal(mkCost);
+      // Taker pays col - mkCost = 10 - 4.7 = 5.3 USDT
+      expect(bobUsdtBefore - (await usdt.balanceOf(bob.address))).to.equal(col - mkCost);
+
+      // Shares: each gets col (10) position tokens, NOT fillAmount (100)
+      // Fixture gives alice 5000 YES + bob 5000 NO from initial split
+      const aliceYes = await ct.balanceOf(alice.address, posId0);
+      const bobNo = await ct.balanceOf(bob.address, posId1);
+      expect(aliceYes).to.equal(ethers.parseEther("5000") + col); // 5000 + 10
+      expect(bobNo).to.equal(ethers.parseEther("5000") + col);   // 5000 + 10
+    });
+
+    it("MINT through settleBatch returns mint_use_sweep skip", async function () {
+      const { exchange, relayer, alice, bob, marketId } = await loadFixture(deployFixture);
+      const exchangeAddr = await exchange.getAddress();
+      const deadline = BigInt((await time.latest()) + 86400);
+
+      const makerOrder = makeOrder({
+        maker: alice.address, outcomeIndex: BigInt(0), side: 0,
+        nonce: BigInt(1), deadline, salt: BigInt(91501),
+      });
+      const takerOrder = makeOrder({
+        maker: bob.address, outcomeIndex: BigInt(1), side: 0,
+        nonce: BigInt(1), deadline, salt: BigInt(91502),
+      });
+      const makerSig = await signOrder(alice, makerOrder, exchangeAddr);
+      const takerSig = await signOrder(bob, takerOrder, exchangeAddr);
+
+      const tx = await exchange.connect(relayer).settleBatch(1, [{
+        makerOrder, takerOrder, makerSig, takerSig,
+        fillAmount: ethers.parseEther("10"), fee: 0n, matchType: 1,
+      }]);
+
+      // V3: MINT fills are rejected from settleBatch
+      await expect(tx).to.emit(exchange, "FillSkipped");
+      await expect(tx).to.emit(exchange, "BatchSettled").withArgs(1, 0, 1, relayer.address);
     });
   });
 });

@@ -357,11 +357,12 @@ describe("CentralizedOracleRouter", function () {
       await usdt.connect(disputer).approve(await router.getAddress(), DISPUTE_BOND);
       await router.connect(disputer).disputeOutcome(1);
 
-      const balBefore = await usdt.balanceOf(disputer.address);
-
       // Council resolves with outcome 1 (different from proposed 0) → disputer wins
       await router.connect(council).councilResolve(1, 1);
 
+      // Pull-based: disputer must withdraw credited bond
+      const balBefore = await usdt.balanceOf(disputer.address);
+      await router.connect(disputer).withdrawBond();
       const balAfter = await usdt.balanceOf(disputer.address);
       expect(balAfter - balBefore).to.equal(DISPUTE_BOND);
 
@@ -388,11 +389,12 @@ describe("CentralizedOracleRouter", function () {
       await usdt.connect(disputer).approve(await router.getAddress(), DISPUTE_BOND);
       await router.connect(disputer).disputeOutcome(1);
 
-      const treasuryBefore = await usdt.balanceOf(treasury.address);
-
       // Council resolves with outcome 0 (same as proposed) → disputer loses bond
       await router.connect(council).councilResolve(1, 0);
 
+      // Pull-based: treasury must withdraw credited bond
+      const treasuryBefore = await usdt.balanceOf(treasury.address);
+      await router.connect(treasury).withdrawBond();
       const treasuryAfter = await usdt.balanceOf(treasury.address);
       expect(treasuryAfter - treasuryBefore).to.equal(DISPUTE_BOND);
     });
@@ -447,10 +449,12 @@ describe("CentralizedOracleRouter", function () {
       await usdt.connect(disputer).approve(await router.getAddress(), DISPUTE_BOND);
       await router.connect(disputer).disputeOutcome(1);
 
-      const balBefore = await usdt.balanceOf(disputer.address);
       await router.connect(council).emergencyReject(1);
-      const balAfter = await usdt.balanceOf(disputer.address);
 
+      // Pull-based: disputer must withdraw credited bond
+      const balBefore = await usdt.balanceOf(disputer.address);
+      await router.connect(disputer).withdrawBond();
+      const balAfter = await usdt.balanceOf(disputer.address);
       expect(balAfter - balBefore).to.equal(DISPUTE_BOND);
     });
 
@@ -507,10 +511,12 @@ describe("CentralizedOracleRouter", function () {
       await router.connect(disputer).disputeOutcome(1);
 
       // 3. Council agrees with original → disputer loses bond
-      const treasuryBefore = await usdt.balanceOf(treasury.address);
       await router.connect(council).councilResolve(1, 0);
-      const treasuryAfter = await usdt.balanceOf(treasury.address);
 
+      // Pull-based: treasury must withdraw credited bond
+      const treasuryBefore = await usdt.balanceOf(treasury.address);
+      await router.connect(treasury).withdrawBond();
+      const treasuryAfter = await usdt.balanceOf(treasury.address);
       expect(treasuryAfter - treasuryBefore).to.equal(DISPUTE_BOND);
 
       // 4. Verify final state
@@ -577,11 +583,12 @@ describe("CentralizedOracleRouter", function () {
       await usdt.connect(disputer).approve(await router.getAddress(), DISPUTE_BOND);
       await router.connect(disputer).disputeOutcome(1);
 
-      const balBefore = await usdt.balanceOf(disputer.address);
-
-      // Emergency resolve — should return bond to disputer
+      // Emergency resolve — should credit bond to disputer
       await router.connect(council).emergencyResolve(1, 1);
 
+      // Pull-based: disputer must withdraw credited bond
+      const balBefore = await usdt.balanceOf(disputer.address);
+      await router.connect(disputer).withdrawBond();
       const balAfter = await usdt.balanceOf(disputer.address);
       expect(balAfter - balBefore).to.equal(DISPUTE_BOND);
     });
@@ -630,7 +637,7 @@ describe("CentralizedOracleRouter", function () {
       // Market 3 has far-future cutoff — cannot propose yet
       await expect(
         router.connect(proposer).proposeOutcome(3, 0),
-      ).to.be.revertedWith("Market not yet ended");
+      ).to.be.revertedWith("Market not yet ended or cutoff not reached");
     });
 
     it("SAFETY_COUNCIL can emergencyResolve before cutoff (bypasses time check)", async function () {
@@ -761,27 +768,18 @@ describe("CentralizedOracleRouter", function () {
   // 14. rescueBond
   // -----------------------------------------------------------------------
   describe("rescueBond", function () {
-    it("rescues bond from orphaned disputed proposal", async function () {
-      const { proposer, council, disputer, router, registry, usdt, marketAdmin } =
+    it("reverts if market is not finalized (QGM-16 prevents orphaned proposals)", async function () {
+      const { proposer, council, disputer, router, usdt } =
         await loadFixture(oracleFixture);
 
-      // Propose and dispute market 1
+      // Propose and dispute — market is resolved but NOT finalized
       await router.connect(proposer).proposeOutcome(1, 0);
       await usdt.connect(disputer).approve(await router.getAddress(), DISPUTE_BOND);
       await router.connect(disputer).disputeOutcome(1);
 
-      // Expire market externally (bypasses OracleRouter)
-      const market = await registry.getMarket(1);
-      await time.increase(3600 * 2 + 1); // past endTime
-      await registry.grantRole(ethers.keccak256(ethers.toUtf8Bytes("KEEPER_ROLE")), council.address);
-      await registry.connect(council).expireMarket(1);
-
-      // Bond is stuck — rescue it
-      const balBefore = await usdt.balanceOf(disputer.address);
-      await router.connect(council).rescueBond(1);
-      const balAfter = await usdt.balanceOf(disputer.address);
-
-      expect(balAfter - balBefore).to.equal(DISPUTE_BOND);
+      await expect(
+        router.connect(council).rescueBond(1),
+      ).to.be.revertedWith("Market not finalized");
     });
 
     it("reverts if proposal is not disputed", async function () {
