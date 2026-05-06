@@ -382,8 +382,10 @@ describe("ProxyWallet", function () {
           { name: "valuesHash", type: "bytes32" },
           { name: "datasHash", type: "bytes32" },
           { name: "nonce", type: "uint256" },
+          { name: "deadline", type: "uint256" },
         ],
       };
+      const deadline = 0n;
 
       // Compute hashes the same way as frontend (useProxyWallet.ts)
       // NOTE: Solidity abi.encodePacked(address[]) pads each address to 32 bytes
@@ -406,10 +408,11 @@ describe("ProxyWallet", function () {
         valuesHash,
         datasHash,
         nonce,
+        deadline,
       });
 
       // Relayer submits batch on behalf
-      await proxy.connect(relayer).executeBatchOnBehalf(targets, values, datas, nonce, sig);
+      await proxy.connect(relayer).executeBatchOnBehalf(targets, values, datas, nonce, deadline, sig);
 
       expect(await usdt.balanceOf(user.address)).to.equal(ethers.parseEther("30"));
       expect(await usdt.balanceOf(relayer.address)).to.equal(ethers.parseEther("20"));
@@ -445,8 +448,10 @@ describe("ProxyWallet", function () {
           { name: "valuesHash", type: "bytes32" },
           { name: "datasHash", type: "bytes32" },
           { name: "nonce", type: "uint256" },
+          { name: "deadline", type: "uint256" },
         ],
       };
+      const deadline = 0n;
 
       const targetsHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["address"], targets));
       const valuesHash = ethers.keccak256(ethers.solidityPacked(["uint256"], values));
@@ -454,12 +459,62 @@ describe("ProxyWallet", function () {
 
       // Sign with otherUser (not the owner)
       const sig = await otherUser.signTypedData(domain, batchTypes, {
-        targetsHash, valuesHash, datasHash, nonce,
+        targetsHash, valuesHash, datasHash, nonce, deadline,
       });
 
       await expect(
-        proxy.connect(relayer).executeBatchOnBehalf(targets, values, datas, nonce, sig),
+        proxy.connect(relayer).executeBatchOnBehalf(targets, values, datas, nonce, deadline, sig),
       ).to.be.revertedWithCustomError(proxy, "InvalidSignature");
+    });
+
+    it("failed batch execution consumes nonce and emits failure event", async function () {
+      const { factory, user, relayer, usdt } = await loadFixture(proxyFixture);
+
+      await factory.createProxy(user.address, ethers.ZeroHash);
+      const proxyAddr = await factory.proxyOf(user.address);
+      const PW = await ethers.getContractFactory("ProxyWallet");
+      const proxy = PW.attach(proxyAddr) as any;
+
+      const targets = [await usdt.getAddress()];
+      const values = [0n];
+      const datas = [
+        usdt.interface.encodeFunctionData("transfer", [user.address, ethers.parseEther("1")]),
+      ];
+      const nonce = 777n;
+      const deadline = 0n;
+
+      const network = await ethers.provider.getNetwork();
+      const domain = {
+        name: "GameClub ProxyWallet",
+        version: "1",
+        chainId: network.chainId,
+        verifyingContract: proxyAddr,
+      };
+      const batchTypes = {
+        ExecuteBatch: [
+          { name: "targetsHash", type: "bytes32" },
+          { name: "valuesHash", type: "bytes32" },
+          { name: "datasHash", type: "bytes32" },
+          { name: "nonce", type: "uint256" },
+          { name: "deadline", type: "uint256" },
+        ],
+      };
+      const targetsHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["address"], targets));
+      const valuesHash = ethers.keccak256(ethers.solidityPacked(["uint256"], values));
+      const datasHash = ethers.keccak256(ethers.solidityPacked(["bytes32"], [ethers.keccak256(datas[0])]));
+
+      const sig = await user.signTypedData(domain, batchTypes, {
+        targetsHash, valuesHash, datasHash, nonce, deadline,
+      });
+
+      await expect(
+        proxy.connect(relayer).executeBatchOnBehalf(targets, values, datas, nonce, deadline, sig)
+      ).to.emit(proxy, "BatchExecutionFailed");
+
+      expect(await proxy.usedNonces(nonce)).to.equal(true);
+      await expect(
+        proxy.connect(relayer).executeBatchOnBehalf(targets, values, datas, nonce, deadline, sig)
+      ).to.be.revertedWithCustomError(proxy, "NonceAlreadyUsed");
     });
   });
 

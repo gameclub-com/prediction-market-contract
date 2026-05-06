@@ -287,6 +287,37 @@ describe("UUPS Upgradeable", () => {
       expect(await upgraded.marketRegistry()).to.equal(f.registryAddr);
     });
 
+    it("preserves ExchangeCLOB critical address slots after upgrade", async () => {
+      const f = await loadFixture(upgradeableFixture);
+
+      // Mutate admin-settable slots so the test does not only validate initializer defaults.
+      await f.exchange.setFeeCollector(f.alice.address);
+      await f.exchange.setTreasury(f.bob.address);
+
+      const before = {
+        usdt: await f.exchange.usdt(),
+        conditionalTokens: await f.exchange.conditionalTokens(),
+        marketRegistry: await f.exchange.marketRegistry(),
+        feeCollector: await f.exchange.feeCollector(),
+        treasury: await f.exchange.treasury(),
+      };
+
+      expect(before.usdt).to.equal(f.usdtAddr);
+      expect(before.conditionalTokens).to.equal(f.ctAddr);
+      expect(before.marketRegistry).to.equal(f.registryAddr);
+      expect(before.feeCollector).to.equal(f.alice.address);
+      expect(before.treasury).to.equal(f.bob.address);
+
+      const ExchangeV2 = await ethers.getContractFactory("ExchangeCLOB");
+      const upgraded = await upgrades.upgradeProxy(f.exchangeAddr, ExchangeV2, { kind: "uups" });
+
+      expect(await upgraded.usdt()).to.equal(before.usdt);
+      expect(await upgraded.conditionalTokens()).to.equal(before.conditionalTokens);
+      expect(await upgraded.marketRegistry()).to.equal(before.marketRegistry);
+      expect(await upgraded.feeCollector()).to.equal(before.feeCollector);
+      expect(await upgraded.treasury()).to.equal(before.treasury);
+    });
+
     it("preserves MarketRegistry state (markets, profiles) after upgrade", async () => {
       const f = await loadFixture(upgradeableFixture);
 
@@ -759,19 +790,13 @@ describe("UUPS Upgradeable", () => {
       return f;
     }
 
-    it("admin can set CPS for a single market", async () => {
+    it("admin cannot mutate CPS for an existing market", async () => {
       const f = await fixtureWithMarkets();
       expect(await f.registry.getCollateralPerSet(1)).to.equal(ethers.parseEther("1")); // 1e18 default
 
-      await f.registry.setCollateralPerSet(1, ethers.parseUnits("0.1", 18));
-      expect(await f.registry.getCollateralPerSet(1)).to.equal(ethers.parseUnits("0.1", 18));
-    });
-
-    it("emits CollateralPerSetUpdated event", async () => {
-      const f = await fixtureWithMarkets();
       await expect(f.registry.setCollateralPerSet(1, ethers.parseUnits("0.1", 18)))
-        .to.emit(f.registry, "CollateralPerSetUpdated")
-        .withArgs(1, ethers.parseEther("1"), ethers.parseUnits("0.1", 18));
+        .to.be.revertedWithCustomError(f.registry, "CollateralPerSetImmutable")
+        .withArgs(1);
     });
 
     it("reverts for non-admin", async () => {
@@ -787,49 +812,17 @@ describe("UUPS Upgradeable", () => {
         .to.be.revertedWithCustomError(f.registry, "MarketNotFound");
     });
 
-    it("reverts for invalid CPS value", async () => {
+    it("still checks market existence before immutability", async () => {
       const f = await fixtureWithMarkets();
-      await expect(f.registry.setCollateralPerSet(1, 12345))
-        .to.be.revertedWith("Invalid collateralPerSet");
-    });
-
-    it("accepts all valid CPS values (1e18, 1e17, 1e16)", async () => {
-      const f = await fixtureWithMarkets();
-      await f.registry.setCollateralPerSet(1, ethers.parseEther("1"));    // 1e18
-      expect(await f.registry.getCollateralPerSet(1)).to.equal(ethers.parseEther("1"));
-
-      await f.registry.setCollateralPerSet(1, ethers.parseUnits("0.1", 18)); // 1e17
-      expect(await f.registry.getCollateralPerSet(1)).to.equal(ethers.parseUnits("0.1", 18));
-
-      await f.registry.setCollateralPerSet(1, ethers.parseUnits("0.01", 18)); // 1e16
-      expect(await f.registry.getCollateralPerSet(1)).to.equal(ethers.parseUnits("0.01", 18));
-    });
-
-    it("batchSetCollateralPerSet updates multiple markets", async () => {
-      const f = await fixtureWithMarkets();
-      const newCps = ethers.parseUnits("0.1", 18);
-
-      await f.registry.batchSetCollateralPerSet([1, 2, 3], newCps);
-
-      expect(await f.registry.getCollateralPerSet(1)).to.equal(newCps);
-      expect(await f.registry.getCollateralPerSet(2)).to.equal(newCps);
-      expect(await f.registry.getCollateralPerSet(3)).to.equal(newCps);
-    });
-
-    it("batchSetCollateralPerSet emits events for each market", async () => {
-      const f = await fixtureWithMarkets();
-      const newCps = ethers.parseUnits("0.1", 18);
-      const oldCps = ethers.parseEther("1");
-
-      const tx = f.registry.batchSetCollateralPerSet([1, 2], newCps);
-      await expect(tx).to.emit(f.registry, "CollateralPerSetUpdated").withArgs(1, oldCps, newCps);
-      await expect(tx).to.emit(f.registry, "CollateralPerSetUpdated").withArgs(2, oldCps, newCps);
-    });
-
-    it("batchSetCollateralPerSet reverts if any market is invalid", async () => {
-      const f = await fixtureWithMarkets();
-      await expect(f.registry.batchSetCollateralPerSet([1, 999], ethers.parseUnits("0.1", 18)))
+      await expect(f.registry.setCollateralPerSet(999, ethers.parseUnits("0.1", 18)))
         .to.be.revertedWithCustomError(f.registry, "MarketNotFound");
+    });
+
+    it("batchSetCollateralPerSet is also immutable", async () => {
+      const f = await fixtureWithMarkets();
+      await expect(f.registry.batchSetCollateralPerSet([1, 2], ethers.parseUnits("0.1", 18)))
+        .to.be.revertedWithCustomError(f.registry, "CollateralPerSetImmutable")
+        .withArgs(1);
     });
 
     it("batchSetCollateralPerSet reverts for non-admin", async () => {

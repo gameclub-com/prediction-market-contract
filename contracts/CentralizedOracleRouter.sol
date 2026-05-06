@@ -210,6 +210,80 @@ contract CentralizedOracleRouter is
     }
 
     // ═══════════════════════════════════════════════════════
+    // EARLY RESOLVE — PROPOSER_ROLE without time gate
+    // ═══════════════════════════════════════════════════════
+
+    /// @notice Propose outcome without tradingCutoff/endTime gate.
+    /// @dev For esports and other markets where the result is known before endTime.
+    ///      Respects disputeWindow (disputeWindow=0 → immediate finalize).
+    ///      Same access control as proposeOutcome (PROPOSER_ROLE).
+    function earlyResolve(
+        uint256 marketId,
+        uint256 outcomeIndex
+    ) external onlyRole(Roles.PROPOSER_ROLE) {
+        _earlyResolve(marketId, outcomeIndex);
+    }
+
+    /// @notice Batch early resolve for multiple markets in a single transaction.
+    function earlyResolveBatch(
+        uint256[] calldata marketIds,
+        uint256[] calldata outcomeIndices
+    ) external onlyRole(Roles.PROPOSER_ROLE) {
+        require(marketIds.length == outcomeIndices.length, "Array length mismatch");
+        require(marketIds.length > 0, "Empty batch");
+
+        for (uint256 i = 0; i < marketIds.length;) {
+            _earlyResolve(marketIds[i], outcomeIndices[i]);
+            unchecked { i++; }
+        }
+    }
+
+    /// @dev Internal early resolve logic — same as _proposeOutcome but without time check.
+    function _earlyResolve(uint256 marketId, uint256 outcomeIndex) internal {
+        if (outcomeIndex > 1) revert InvalidOutcome(outcomeIndex);
+
+        Proposal storage p = _proposals[marketId];
+        if (p.status == ProposalStatus.PROPOSED || p.status == ProposalStatus.DISPUTED || p.status == ProposalStatus.FINALIZED) {
+            revert ProposalAlreadyExists(marketId);
+        }
+
+        (bool disputeEnabled, uint256 disputeWindow,) = marketRegistry.getDisputeConfig(marketId);
+
+        marketRegistry.setResolved(marketId);
+
+        if (!disputeEnabled || disputeWindow == 0) {
+            marketRegistry.finalizeResolution(marketId, outcomeIndex);
+
+            _proposals[marketId] = Proposal({
+                outcomeIndex: outcomeIndex,
+                proposer: msg.sender,
+                proposedAt: block.timestamp,
+                disputeDeadline: block.timestamp,
+                status: ProposalStatus.FINALIZED,
+                disputer: address(0),
+                disputeBond: 0
+            });
+
+            emit OutcomeProposed(marketId, outcomeIndex, msg.sender, block.timestamp);
+            emit OutcomeFinalized(marketId, outcomeIndex);
+        } else {
+            uint256 deadline = block.timestamp + disputeWindow;
+
+            _proposals[marketId] = Proposal({
+                outcomeIndex: outcomeIndex,
+                proposer: msg.sender,
+                proposedAt: block.timestamp,
+                disputeDeadline: deadline,
+                status: ProposalStatus.PROPOSED,
+                disputer: address(0),
+                disputeBond: 0
+            });
+
+            emit OutcomeProposed(marketId, outcomeIndex, msg.sender, deadline);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════
     // COUNCIL FUNCTIONS (Implementation-specific)
     // ═══════════════════════════════════════════════════════
 
@@ -255,6 +329,18 @@ contract CentralizedOracleRouter is
     /// @notice Council rejects the proposal entirely. Market returns to unresolved.
     /// @dev Allows a new proposal to be submitted. Bond is returned to disputer.
     function emergencyReject(uint256 marketId) external onlyRole(Roles.COUNCIL_ROLE) nonReentrant {
+        _emergencyReject(marketId, 0, false);
+    }
+
+    /// @notice Council rejects the proposal and resets tradingCutoff so the market can resume trading.
+    function emergencyRejectAndResetCutoff(
+        uint256 marketId,
+        uint256 newCutoff
+    ) external onlyRole(Roles.COUNCIL_ROLE) nonReentrant {
+        _emergencyReject(marketId, newCutoff, true);
+    }
+
+    function _emergencyReject(uint256 marketId, uint256 newCutoff, bool resetCutoff) internal {
         Proposal storage p = _proposals[marketId];
         if (p.status != ProposalStatus.PROPOSED && p.status != ProposalStatus.DISPUTED) {
             revert ProposalNotFound(marketId);
@@ -270,6 +356,9 @@ contract CentralizedOracleRouter is
 
         // Roll back resolved state so market can resume trading
         marketRegistry.unresolve(marketId);
+        if (resetCutoff) {
+            marketRegistry.resetTradingCutoff(marketId, newCutoff);
+        }
 
         // Unfreeze if frozen
         try marketRegistry.unfreezeMarket(marketId) {} catch {}

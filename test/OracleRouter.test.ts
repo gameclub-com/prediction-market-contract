@@ -340,6 +340,17 @@ describe("CentralizedOracleRouter", function () {
         router.finalizeOutcome(1),
       ).to.be.revertedWithCustomError(router, "ProposalNotProposed");
     });
+
+    it("should revert if the market is frozen", async function () {
+      const { proposer, council, router, registry } = await loadFixture(oracleFixture);
+
+      await router.connect(proposer).proposeOutcome(1, 0);
+      await registry.connect(council).freezeMarket(1);
+      await time.increase(DISPUTE_WINDOW + 1);
+
+      await expect(router.finalizeOutcome(1))
+        .to.be.revertedWithCustomError(registry, "MarketFrozen");
+    });
   });
 
   // -----------------------------------------------------------------------
@@ -492,6 +503,19 @@ describe("CentralizedOracleRouter", function () {
       await expect(
         router.connect(council).emergencyReject(1),
       ).to.be.revertedWithCustomError(router, "ProposalNotFound");
+    });
+
+    it("should reset tradingCutoff when using the recovery helper", async function () {
+      const { proposer, council, router, registry } = await loadFixture(oracleFixture);
+
+      await router.connect(proposer).proposeOutcome(1, 0);
+      const newCutoff = BigInt((await time.latest()) + 1800);
+
+      await router.connect(council).emergencyRejectAndResetCutoff(1, newCutoff);
+
+      const market = await registry.getMarket(1);
+      expect(market.resolved).to.equal(false);
+      expect(market.tradingCutoff).to.equal(newCutoff);
     });
   });
 

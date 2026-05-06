@@ -49,6 +49,9 @@ logs/
 *.pid
 *.seed
 
+# Local audit / working docs
+/docs/
+
 # Capture script
 scripts/auth-state.json
 scripts/captures/

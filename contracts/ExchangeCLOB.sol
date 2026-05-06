@@ -7,7 +7,10 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
+import "@openzeppelin/contracts/interfaces/IERC165.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 import "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/interfaces/IERC1271.sol";
@@ -20,6 +23,7 @@ import "./MarketRegistry.sol";
 ///         Users hold tokens in their own wallets (ProxyWallet). Exchange pulls via approval.
 ///         No deposit/withdraw — Exchange never custodies user funds (except transiently for MINT/MERGE).
 /// @dev EIP-712 signed orders. MatchType: COMPLEMENTARY, MINT, MERGE.
+///      v2 minimum-fix: trackedShares model removed; QGM-03 closed via subtractOI revert only.
 contract ExchangeCLOB is
     Initializable,
     AccessControlEnumerableUpgradeable,
@@ -28,6 +32,7 @@ contract ExchangeCLOB is
     UUPSUpgradeable
 {
     using SafeERC20 for IERC20;
+    using Math for uint256;
 
     // ─── Enums ───
     enum Side { BUY, SELL }
@@ -104,6 +109,12 @@ contract ExchangeCLOB is
     error OnlyNormalMode();
     error SweepLengthMismatch();
     error SweepEmpty();
+    error ReceiverIncompatible();
+    error ArithmeticOverflow();
+    error ReentrantCall();
+    error ZeroAddress();
+    error NonceNotIncreasing();
+    error SweepValidation(uint8 code);
 
     // ─── Events ───
     event OrderCancelled(address indexed maker, bytes32 orderHash);
@@ -122,6 +133,7 @@ contract ExchangeCLOB is
     );
     event FillSkipped(uint256 indexed marketId, bytes32 orderHash, string reason);
     event BatchSettled(uint256 indexed batchId, uint256 successCount, uint256 skipCount, address relayer);
+    event ForceSettled(uint256 indexed batchId, uint256 successCount, uint256 skipCount, address indexed caller);
 
     event FeesClaimed(address indexed collector, uint256 amount);
     event ShutdownModeChanged(ShutdownMode mode);
@@ -134,7 +146,7 @@ contract ExchangeCLOB is
     uint256 private constant _ENTERED = 2;
 
     modifier nonReentrant() {
-        require(_reentrancyStatus != _ENTERED, "ReentrancyGuard: reentrant call");
+        if (_reentrancyStatus == _ENTERED) revert ReentrantCall();
         _reentrancyStatus = _ENTERED;
         _;
         _reentrancyStatus = _NOT_ENTERED;
@@ -165,6 +177,7 @@ contract ExchangeCLOB is
     MarketRegistry public marketRegistry;       // was immutable
     address public feeCollector;
     address public treasury;
+    // NOTE: trackedShares removed (minimum-fix model). QGM-03 closed via subtractOI revert.
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -179,11 +192,13 @@ contract ExchangeCLOB is
         address _treasury
     ) external initializer {
         // L-3: Zero-address checks
-        require(_usdt != address(0), "Zero usdt");
-        require(_conditionalTokens != address(0), "Zero ct");
-        require(_marketRegistry != address(0), "Zero registry");
-        require(_feeCollector != address(0), "Zero feeCollector");
-        require(_treasury != address(0), "Zero treasury");
+        if (
+            _usdt == address(0) ||
+            _conditionalTokens == address(0) ||
+            _marketRegistry == address(0) ||
+            _feeCollector == address(0) ||
+            _treasury == address(0)
+        ) revert ZeroAddress();
 
         __AccessControlEnumerable_init();
         __EIP712_init("GameClub Exchange", "1");
@@ -230,7 +245,7 @@ contract ExchangeCLOB is
 
     // L-1: Enforce monotonic increase + L-6: notFreezeAll
     function cancelAllBelowNonce(uint256 nonce) external notFreezeAll {
-        require(nonce > userNonce[msg.sender], "Can only increase nonce");
+        if (nonce <= userNonce[msg.sender]) revert NonceNotIncreasing();
         userNonce[msg.sender] = nonce;
         emit NonceBumped(msg.sender, nonce);
     }
@@ -270,6 +285,46 @@ contract ExchangeCLOB is
     }
 
     // ═══════════════════════════════════════════════════════
+    // FORCE SETTLEMENT (resolved/expired markets — admin recovery)
+    // ═══════════════════════════════════════════════════════
+
+    /// @notice Settle fills on resolved/expired markets. Skips _checkMarket and deadline checks.
+    /// @dev Only callable by SAFETY_COUNCIL_ROLE. Still validates signatures and balances.
+    function forceSettleBatch(
+        uint256 batchId, Fill[] calldata fills
+    ) external onlyRole(Roles.SAFETY_COUNCIL_ROLE) nonReentrant {
+        if (fills.length > MAX_FILLS_PER_BATCH) revert TooManyFills(fills.length, MAX_FILLS_PER_BATCH);
+
+        bytes32 batchKey = bytes32(batchId);
+        if (processedBatches[batchKey]) revert BatchAlreadyProcessed(batchId);
+        processedBatches[batchKey] = true;
+
+        uint256 successCount;
+        uint256 skipCount;
+        BatchAcc memory acc;
+
+        for (uint256 i = 0; i < fills.length;) {
+            string memory reason = _processForceSettleFill(fills[i], acc);
+            if (bytes(reason).length == 0) {
+                successCount++;
+            } else {
+                emit FillSkipped(fills[i].makerOrder.marketId, _orderDigest(fills[i].makerOrder), reason);
+                skipCount++;
+            }
+            unchecked { i++; }
+        }
+
+        if (acc.fees > 0) _collectFee(acc.fees);
+        if (acc.surplus > 0) usdt.safeTransfer(treasury, acc.surplus);
+
+        emit ForceSettled(batchId, successCount, skipCount, msg.sender);
+    }
+
+    function _processForceSettleFill(Fill calldata fill, BatchAcc memory acc) internal returns (string memory) {
+        return _processFillInternal(fill, acc, true);
+    }
+
+    // ═══════════════════════════════════════════════════════
     // V3: AGGREGATED MINT SWEEP
     // ═══════════════════════════════════════════════════════
 
@@ -296,58 +351,73 @@ contract ExchangeCLOB is
     function _executeMintSweep(MintSweep calldata sw, uint256 n) internal {
         uint256 marketId = sw.takerOrder.marketId;
         string memory err = _checkMarket(marketId);
-        require(bytes(err).length == 0, err);
+        if (bytes(err).length > 0) revert SweepValidation(1);
 
         MarketRegistry.Market memory market = marketRegistry.getMarket(marketId);
         uint256 cps = _getCollateralPerSet(marketId);
 
-        require(sw.takerOrder.side == Side.BUY, "sw:taker_buy");
-        bytes32 takerHash = _orderDigest(sw.takerOrder);
-        err = _validateOrder(sw.takerOrder, sw.takerSig, false, takerHash);
-        require(bytes(err).length == 0, err);
+        if (sw.takerOrder.side != Side.BUY) revert SweepValidation(2);
+        if (sw.takerOrder.outcomeIndex >= market.outcomeSlotCount) revert SweepValidation(3);
+        if (sw.takerOrder.price > cps) revert SweepValidation(4);
+        _requireERC1155Receiver(sw.takerOrder.maker);
 
-        // QGM-05: Pre-check aggregate balance for self-matched sweeps (maker == taker)
+        bytes32 takerHash = _orderDigest(sw.takerOrder);
+        err = _validateOrder(sw.takerOrder, sw.takerSig, false, takerHash, false);
+        if (bytes(err).length > 0) revert SweepValidation(5);
+
         {
             uint256 selfMakerCost;
             uint256 estTakerCost;
             for (uint256 i = 0; i < n;) {
-                uint256 mkCost = (sw.makerOrders[i].price * sw.fillAmounts[i]) / 1e18;
-                uint256 col = (sw.fillAmounts[i] * cps) / 1e18;
+                uint256 amt = sw.fillAmounts[i];
+                if (amt == 0) revert SweepValidation(6);
+
+                uint256 mkPrice = sw.makerOrders[i].price;
+                if (mkPrice > cps) revert SweepValidation(7);
+
+                uint256 col = Math.mulDiv(amt, cps, 1e18);
+                if (col == 0) revert SweepValidation(8);
+
+                uint256 mkCost = Math.mulDiv(mkPrice, amt, 1e18);
+                if (mkCost > col) revert SweepValidation(9);
+                if (sw.fees[i] * 10_000 > col * MAX_FEE) revert SweepValidation(10);
+
                 if (sw.makerOrders[i].maker == sw.takerOrder.maker) {
-                    selfMakerCost += mkCost;
+                    selfMakerCost = _checkedAdd(selfMakerCost, mkCost);
                 }
-                estTakerCost += (col - mkCost + sw.fees[i]);
+                estTakerCost = _checkedAdd(estTakerCost, col - mkCost + sw.fees[i]);
                 unchecked { i++; }
             }
+
             if (selfMakerCost > 0) {
-                uint256 totalCost = selfMakerCost + estTakerCost;
-                require(usdt.balanceOf(sw.takerOrder.maker) >= totalCost, "sw:self_bal");
-                require(usdt.allowance(sw.takerOrder.maker, address(this)) >= totalCost, "sw:self_alw");
+                uint256 totalCost = _checkedAdd(selfMakerCost, estTakerCost);
+                if (usdt.balanceOf(sw.takerOrder.maker) < totalCost) revert SweepValidation(11);
+                if (usdt.allowance(sw.takerOrder.maker, address(this)) < totalCost) revert SweepValidation(12);
             }
         }
 
-        // Pass 1: validate makers, pull USDT, track fills
         (uint256 totalFill, uint256 totalCol, uint256 totalTakerCost, BatchAcc memory acc)
             = _sweepMakerPass(sw, n, marketId, cps);
 
-        // Taker fill tracking
         uint256 tf = filled[takerHash];
-        require(tf != type(uint256).max && tf + totalFill <= sw.takerOrder.amount, "sw:taker_ovfill");
+        if (tf == type(uint256).max || tf + totalFill > sw.takerOrder.amount) revert SweepValidation(13);
         filled[takerHash] += totalFill;
         _dustKill(takerHash, sw.takerOrder.amount);
 
-        // Taker USDT pull (once)
-        require(usdt.balanceOf(sw.takerOrder.maker) >= totalTakerCost, "sw:taker_bal");
-        require(usdt.allowance(sw.takerOrder.maker, address(this)) >= totalTakerCost, "sw:taker_alw");
+        if (usdt.balanceOf(sw.takerOrder.maker) < totalTakerCost) revert SweepValidation(14);
+        if (usdt.allowance(sw.takerOrder.maker, address(this)) < totalTakerCost) revert SweepValidation(15);
         usdt.safeTransferFrom(sw.takerOrder.maker, address(this), totalTakerCost);
 
-        // OI + single splitPosition
-        if (market.maxOpenInterest > 0)
-            require(market.currentOI + totalFill <= market.maxOpenInterest, "sw:oi");
-        marketRegistry.addVolumeAndOI(marketId, totalCol, totalFill);
+        if (totalCol == 0) revert SweepValidation(16);
+        // Option C: maxOpenInterest cap is now enforced inside MarketRegistry.addOIByCondition,
+        //           triggered by ConditionalTokens.splitPosition() below.
+        //           ExchangeCLOB only tracks volume; OI is auto-incremented in CT layer.
+        marketRegistry.addVolume(marketId, totalCol);
         conditionalTokens.splitPosition(market.conditionId, totalCol);
+        // After splitPosition: ExchangeCLOB holds both outcome shares + their OI eligibility.
+        // The eligibility moves to maker/taker recipients via _update transfer hook
+        // when shares are distributed in _sweepDistributePass / takerPosId transfer below.
 
-        // Pass 2: distribute shares + emit events (shares = fillAmount × CPS / 1e18)
         _sweepDistributePass(sw, n, market.conditionId, marketId, cps);
         uint256 takerPosId = _getPositionId(market.conditionId, sw.takerOrder.outcomeIndex);
         conditionalTokens.safeTransferFrom(address(this), sw.takerOrder.maker, takerPosId, totalCol, "");
@@ -364,29 +434,34 @@ contract ExchangeCLOB is
             uint256 amt = sw.fillAmounts[i];
             uint256 fee = sw.fees[i];
 
-            require(mk.side == Side.BUY && mk.marketId == marketId, "sw:mk_invalid");
-            require(mk.outcomeIndex != sw.takerOrder.outcomeIndex, "sw:same_out");
+            if (mk.side != Side.BUY || mk.marketId != marketId) revert SweepValidation(17);
+            if (mk.outcomeIndex >= 2) revert SweepValidation(18);
+            if (mk.outcomeIndex == sw.takerOrder.outcomeIndex) revert SweepValidation(19);
+            if (mk.price > cps) revert SweepValidation(20);
+            _requireERC1155Receiver(mk.maker);
             bytes32 mkH = _orderDigest(mk);
-            string memory mkErr = _validateOrder(mk, sw.makerSigs[i], true, mkH);
-            require(bytes(mkErr).length == 0, mkErr);
+            string memory mkErr = _validateOrder(mk, sw.makerSigs[i], true, mkH, false);
+            if (bytes(mkErr).length > 0) revert SweepValidation(21);
             uint256 mf = filled[mkH];
-            require(mf != type(uint256).max && mf + amt <= mk.amount, "sw:mk_ovfill");
+            if (mf == type(uint256).max || mf + amt > mk.amount) revert SweepValidation(22);
             require(mk.price + sw.takerOrder.price >= cps, "sw:price_sum");
 
-            uint256 col = (amt * cps) / 1e18;
-            uint256 mkCost = (mk.price * amt) / 1e18;
-            require(col == 0 || fee * 10_000 <= col * MAX_FEE, "sw:fee");
-            require(usdt.balanceOf(mk.maker) >= mkCost, "sw:mk_bal");
-            require(usdt.allowance(mk.maker, address(this)) >= mkCost, "sw:mk_alw");
+            uint256 col = Math.mulDiv(amt, cps, 1e18);
+            if (col == 0) revert SweepValidation(23);
+            uint256 mkCost = Math.mulDiv(mk.price, amt, 1e18);
+            if (mkCost > col) revert SweepValidation(24);
+            if (fee * 10_000 > col * MAX_FEE) revert SweepValidation(25);
+            if (usdt.balanceOf(mk.maker) < mkCost) revert SweepValidation(26);
+            if (usdt.allowance(mk.maker, address(this)) < mkCost) revert SweepValidation(27);
 
             filled[mkH] += amt;
             _dustKill(mkH, mk.amount);
             usdt.safeTransferFrom(mk.maker, address(this), mkCost);
 
-            totalFill += amt;
-            totalCol += col;
-            totalTakerCost += (col - mkCost + fee);
-            if (fee > 0) acc.fees += fee;
+            totalFill = _checkedAdd(totalFill, amt);
+            totalCol = _checkedAdd(totalCol, col);
+            totalTakerCost = _checkedAdd(totalTakerCost, col - mkCost + fee);
+            if (fee > 0) acc.fees = _checkedAdd(acc.fees, fee);
             unchecked { i++; }
         }
     }
@@ -395,7 +470,7 @@ contract ExchangeCLOB is
         MintSweep calldata sw, uint256 n, bytes32 conditionId, uint256 marketId, uint256 cps
     ) internal {
         for (uint256 i = 0; i < n;) {
-            uint256 shares = (sw.fillAmounts[i] * cps) / 1e18;
+            uint256 shares = Math.mulDiv(sw.fillAmounts[i], cps, 1e18);
             uint256 mkPosId = _getPositionId(conditionId, sw.makerOrders[i].outcomeIndex);
             conditionalTokens.safeTransferFrom(address(this), sw.makerOrders[i].maker, mkPosId, shares, "");
             emit FillExecuted(
@@ -409,69 +484,79 @@ contract ExchangeCLOB is
 
     /// @dev Returns empty string on success, or skip reason on failure.
     function _processFill(Fill calldata fill, BatchAcc memory acc) internal returns (string memory) {
-        if (fill.fillAmount == 0) return "zero_fill_amount";
+        return _processFillInternal(fill, acc, false);
+    }
+
+    /// @dev Unified fill processor. force=true skips _checkMarket and deadline (force-settle path).
+    /// @dev Skip reasons use short codes for EIP-170 size; see docs/audit-v2-operational-notes-ko.md §3 for mapping.
+    function _processFillInternal(Fill calldata fill, BatchAcc memory acc, bool force) internal returns (string memory) {
+        if (fill.fillAmount == 0) return "zf";
 
         Order calldata maker = fill.makerOrder;
         Order calldata taker = fill.takerOrder;
 
-        if (maker.marketId != taker.marketId) return "market_mismatch";
+        if (maker.marketId != taker.marketId) return "mm";
 
         MatchType mt = fill.matchType;
         if (mt == MatchType.COMPLEMENTARY) {
-            if (uint8(maker.side) == uint8(taker.side)) return "same_side";
+            if (uint8(maker.side) == uint8(taker.side)) return "ss";
         } else if (mt == MatchType.MINT) {
-            if (maker.side != Side.BUY || taker.side != Side.BUY) return "mint_requires_buys";
-            if (maker.outcomeIndex == taker.outcomeIndex) return "mint_same_outcome";
+            if (maker.side != Side.BUY || taker.side != Side.BUY) return "mb";
+            if (maker.outcomeIndex == taker.outcomeIndex) return "mo";
         } else if (mt == MatchType.MERGE) {
-            if (maker.side != Side.SELL || taker.side != Side.SELL) return "merge_requires_sells";
-            if (maker.outcomeIndex == taker.outcomeIndex) return "merge_same_outcome";
+            if (maker.side != Side.SELL || taker.side != Side.SELL) return "ms";
+            if (maker.outcomeIndex == taker.outcomeIndex) return "mso";
         }
 
-        string memory marketErr = _checkMarket(maker.marketId);
-        if (bytes(marketErr).length > 0) return marketErr;
+        if (force) {
+            // Force-settle: skip _checkMarket (resolved/expired markets allowed)
+            if (!marketRegistry.getMarket(maker.marketId).exists) return "mnf";
+        } else {
+            string memory marketErr = _checkMarket(maker.marketId);
+            if (bytes(marketErr).length > 0) return marketErr;
+        }
 
         bytes32 makerHash = _orderDigest(maker);
         bytes32 takerHash = _orderDigest(taker);
 
-        string memory makerErr = _validateOrder(maker, fill.makerSig, true, makerHash);
+        string memory makerErr = _validateOrder(maker, fill.makerSig, true, makerHash, force);
         if (bytes(makerErr).length > 0) return makerErr;
-        string memory takerErr = _validateOrder(taker, fill.takerSig, false, takerHash);
+        string memory takerErr = _validateOrder(taker, fill.takerSig, false, takerHash, force);
         if (bytes(takerErr).length > 0) return takerErr;
 
         uint256 makerFilled = filled[makerHash];
-        if (makerFilled == type(uint256).max || makerFilled + fill.fillAmount > maker.amount) return "maker_overfill";
+        if (makerFilled == type(uint256).max || makerFilled + fill.fillAmount > maker.amount) return "mof";
         uint256 takerFilled = filled[takerHash];
-        if (takerFilled == type(uint256).max || takerFilled + fill.fillAmount > taker.amount) return "taker_overfill";
+        if (takerFilled == type(uint256).max || takerFilled + fill.fillAmount > taker.amount) return "tof";
 
         return _executeSettlement(fill, makerHash, takerHash, acc);
     }
 
     function _checkMarket(uint256 marketId) internal view returns (string memory) {
         MarketRegistry.Market memory m = marketRegistry.getMarket(marketId);
-        if (!m.exists) return "market_not_found";
-        if (m.resolved) return "market_resolved";
-        if (m.frozen) return "market_frozen";
+        if (!m.exists) return "mnf";
+        if (m.resolved) return "mrs";
+        if (m.frozen) return "mfr";
         // H-1 v2: Enforce tradingCutoff on-chain (endTime not checked — relayer grace period)
-        if (m.tradingCutoff > 0 && block.timestamp >= m.tradingCutoff) return "trading_cutoff_passed";
+        if (m.tradingCutoff > 0 && block.timestamp >= m.tradingCutoff) return "mcp";
         return "";
     }
 
     // M-1: Takes precomputed hash to avoid double computation
     // H-3: Added sanctioned check
+    // skipDeadline=true: force-settle path (allows expired orders for recovery)
     function _validateOrder(
-        Order calldata order, bytes calldata sig, bool isMaker, bytes32 h
+        Order calldata order, bytes calldata sig, bool isMaker, bytes32 h, bool skipDeadline
     ) internal view returns (string memory) {
-        string memory prefix = isMaker ? "maker" : "taker";
-
-        if (order.orderType != OrderType.LIMIT) return string.concat(prefix, "_unsupported_type");
-        if (sanctioned[order.maker]) return string.concat(prefix, "_sanctioned");
-        if (order.nonce < userNonce[order.maker]) return string.concat(prefix, "_nonce_low");
-        if (isCancelled[h]) return string.concat(prefix, "_cancelled");
-        if (block.timestamp > order.deadline) return string.concat(prefix, "_expired");
+        if (order.orderType != OrderType.LIMIT) return isMaker ? "mut" : "tut";
+        if (sanctioned[order.maker]) return isMaker ? "msn" : "tsn";
+        if (order.nonce < userNonce[order.maker]) return isMaker ? "mnl" : "tnl";
+        if (isCancelled[h]) return isMaker ? "mcl" : "tcl";
+        if (!skipDeadline && block.timestamp > order.deadline) return isMaker ? "mexp" : "texp";
 
         if (!_verifySignature(order.maker, h, sig)) {
-            if (order.maker.code.length > 0) return string.concat(prefix, "_sig_contract_failed");
-            return string.concat(prefix, "_sig_invalid");
+            if (order.maker.code.length > 0) return isMaker ? "mscf" : "tscf";
+            return isMaker ? "msig" : "tsig";
         }
         return "";
     }
@@ -480,8 +565,7 @@ contract ExchangeCLOB is
         FillCtx memory ctx;
         ctx.marketId = fill.makerOrder.marketId;
         ctx.executionPrice = fill.makerOrder.price; // Maker price (Surplus Matching)
-        // M-5: ceilDiv for buyer cost (round in protocol's favor)
-        ctx.fillValue = _ceilDiv(ctx.executionPrice * fill.fillAmount, 1e18);
+        ctx.fillValue = Math.mulDiv(ctx.executionPrice, fill.fillAmount, 1e18, Math.Rounding.Ceil);
         ctx.outcomeIndex = fill.makerOrder.outcomeIndex;
         ctx.makerHash = makerHash;
         ctx.takerHash = takerHash;
@@ -490,7 +574,7 @@ contract ExchangeCLOB is
         ctx.conditionId = market.conditionId;
 
         // V3: MINT fills must go through settleMintSweep
-        if (fill.matchType == MatchType.MINT) return "mint_use_sweep";
+        if (fill.matchType == MatchType.MINT) return "mus";
 
         if (fill.matchType == MatchType.COMPLEMENTARY) {
             return _executeComplementary(fill, ctx, acc);
@@ -502,17 +586,17 @@ contract ExchangeCLOB is
     /// @dev COMPLEMENTARY: same-token BUY↔SELL — P2P transferFrom
     function _executeComplementary(Fill calldata fill, FillCtx memory ctx, BatchAcc memory acc) internal returns (string memory) {
         // H-5 v2: Both orders must reference the same outcome for COMPLEMENTARY
-        if (fill.makerOrder.outcomeIndex != fill.takerOrder.outcomeIndex) return "outcome_mismatch";
+        if (fill.makerOrder.outcomeIndex != fill.takerOrder.outcomeIndex) return "ocm";
 
         // Price crossing validation
         if (fill.takerOrder.side == Side.BUY) {
-            if (ctx.executionPrice > fill.takerOrder.price) return "price_not_crossing";
+            if (ctx.executionPrice > fill.takerOrder.price) return "pnc";
         } else {
-            if (ctx.executionPrice < fill.takerOrder.price) return "price_not_crossing";
+            if (ctx.executionPrice < fill.takerOrder.price) return "pnc";
         }
 
         // Fee bps check
-        if (ctx.fillValue > 0 && fill.fee * 10_000 > ctx.fillValue * MAX_FEE) return "fee_too_high";
+        if (ctx.fillValue > 0 && fill.fee * 10_000 > ctx.fillValue * MAX_FEE) return "fth";
 
         // Determine buyer/seller
         if (fill.makerOrder.side == Side.BUY) {
@@ -526,17 +610,22 @@ contract ExchangeCLOB is
         // CPS scaling: on-chain conditional tokens are denominated in collateral units,
         // not fillAmount units. 1 off-chain "share" = CPS/1e18 conditional tokens.
         uint256 cps = _getCollateralPerSet(ctx.marketId);
-        uint256 shareAmount = (fill.fillAmount * cps) / 1e18;
+        uint256 shareAmount = Math.mulDiv(fill.fillAmount, cps, 1e18);
+        if (shareAmount == 0) return "saz";
 
         // Non-custodial balance + allowance checks (on-chain)
+        // QGM-12: buyer pays fillValue + fee; seller receives full fillValue
         uint256 posId = _getPositionId(ctx.conditionId, ctx.outcomeIndex);
-        if (usdt.balanceOf(ctx.buyer) < ctx.fillValue) return "buyer_insufficient_balance";
+        uint256 buyerTotal = _checkedAdd(ctx.fillValue, fill.fee);
+        if (usdt.balanceOf(ctx.buyer) < buyerTotal) return "bib";
         // M-8 v2: Pre-check allowance to avoid batch-killing revert
-        if (usdt.allowance(ctx.buyer, address(this)) < ctx.fillValue) return "buyer_insufficient_allowance";
+        if (usdt.allowance(ctx.buyer, address(this)) < buyerTotal) return "bia";
         if (conditionalTokens.balanceOf(ctx.seller, posId) < shareAmount) {
-            return "seller_insufficient_shares";
+            return "sis";
         }
-        if (!conditionalTokens.isApprovedForAll(ctx.seller, address(this))) return "seller_not_approved";
+        if (!conditionalTokens.isApprovedForAll(ctx.seller, address(this))) return "sna";
+        // QGM-30: ERC1155 receiver pre-check
+        if (!_canReceiveERC1155(ctx.buyer)) return "bri";
 
         // ── Execute (CEI) ──
         _applyComplementary(fill, ctx, posId, shareAmount, acc);
@@ -548,16 +637,17 @@ contract ExchangeCLOB is
     /// @dev MERGE: cross-outcome SELL+SELL → mergePositions
     function _executeMerge(Fill calldata fill, FillCtx memory ctx, BatchAcc memory acc) internal returns (string memory) {
         uint256 cps = _getCollateralPerSet(ctx.marketId);
-        if (fill.makerOrder.price + fill.takerOrder.price > cps) return "price_sum_above_one";
+        if (fill.makerOrder.price + fill.takerOrder.price > cps) return "pao";
 
         // Fee check: fee against collateral, not shares
-        uint256 collateral = (fill.fillAmount * cps) / 1e18;
-        if (collateral > 0 && fill.fee * 10_000 > collateral * MAX_FEE) return "fee_too_high";
+        uint256 collateral = Math.mulDiv(fill.fillAmount, cps, 1e18);
+        if (collateral == 0) return "mzc";
+        if (fill.fee * 10_000 > collateral * MAX_FEE) return "fth";
 
         // H-1: Fee underflow guard — check fee doesn't exceed taker proceeds
-        uint256 makerPay = (fill.makerOrder.price * fill.fillAmount) / 1e18;
+        uint256 makerPay = Math.mulDiv(fill.makerOrder.price, fill.fillAmount, 1e18);
         uint256 takerPay = collateral - makerPay;
-        if (fill.fee > takerPay) return "fee_exceeds_taker_proceeds";
+        if (fill.fee > takerPay) return "ftp";
 
         // Non-custodial shares checks
         uint256 makerOi = fill.makerOrder.outcomeIndex;
@@ -566,15 +656,20 @@ contract ExchangeCLOB is
         uint256 takerPosId = _getPositionId(ctx.conditionId, takerOi);
 
         if (conditionalTokens.balanceOf(fill.makerOrder.maker, makerPosId) < collateral) {
-            return "maker_insufficient_shares";
+            return "mis";
         }
-        if (!conditionalTokens.isApprovedForAll(fill.makerOrder.maker, address(this))) return "maker_not_approved";
+        if (!conditionalTokens.isApprovedForAll(fill.makerOrder.maker, address(this))) return "mna";
         if (conditionalTokens.balanceOf(fill.takerOrder.maker, takerPosId) < collateral) {
-            return "taker_insufficient_shares";
+            return "tis";
         }
-        if (!conditionalTokens.isApprovedForAll(fill.takerOrder.maker, address(this))) return "taker_not_approved";
+        if (!conditionalTokens.isApprovedForAll(fill.takerOrder.maker, address(this))) return "tna";
 
-        _applyMerge(fill, ctx, makerPosId, takerPosId, makerPay, acc);
+        // NOTE: trackedShares (musr/tusr) check removed — minimum-fix model.
+        //       Direct-split shares fed into MERGE are blocked at MarketRegistry.subtractOI revert,
+        //       which atomically rolls back the entire fill (no fund loss, just tx revert).
+        //       Off-chain BatchBuilder should pre-filter via share_acquisitions tracking.
+
+        _applyMerge(fill, ctx, makerPosId, takerPosId, makerPay, collateral, acc);
         return "";
     }
 
@@ -591,13 +686,12 @@ contract ExchangeCLOB is
         _dustKill(ctx.makerHash, fill.makerOrder.amount);
         _dustKill(ctx.takerHash, fill.takerOrder.amount);
 
-        // ── 4. USDT: buyer → seller (minus fee), fee accumulated in BatchAcc ──
-        // QGM-06: Collect USDT before ERC1155 transfer to prevent callback manipulation
+        // ── 4. USDT: buyer → seller (full fillValue), fee paid separately by buyer ──
+        // QGM-12: buyer pays fillValue + fee separately. Seller receives full fillValue.
         uint256 sellerProceeds = ctx.fillValue;
         if (fill.fee > 0) {
-            sellerProceeds -= fill.fee;
             usdt.safeTransferFrom(ctx.buyer, address(this), fill.fee);
-            acc.fees += fill.fee;
+            acc.fees = _checkedAdd(acc.fees, fill.fee);
         }
         if (sellerProceeds > 0) {
             usdt.safeTransferFrom(ctx.buyer, ctx.seller, sellerProceeds);
@@ -619,11 +713,9 @@ contract ExchangeCLOB is
     /// @dev MERGE settlement: SELL+SELL → mergePositions (transient custody)
     function _applyMerge(
         Fill calldata fill, FillCtx memory ctx,
-        uint256 makerPosId, uint256 takerPosId, uint256 makerPay, BatchAcc memory acc
+        uint256 makerPosId, uint256 takerPosId, uint256 makerPay, uint256 collateral, BatchAcc memory acc
     ) internal {
         uint256 amt = fill.fillAmount;
-        uint256 cps = _getCollateralPerSet(ctx.marketId);
-        uint256 collateral = (amt * cps) / 1e18;
         address makerAddr = fill.makerOrder.maker;
         address takerAddr = fill.takerOrder.maker;
 
@@ -631,9 +723,13 @@ contract ExchangeCLOB is
         filled[ctx.makerHash] += amt;
         filled[ctx.takerHash] += amt;
 
-        // ── 2. M-4: MERGE = volume + OI decrease ──
+        // ── 2. M-4: MERGE = volume only at this layer ──
+        // Option C: OI decrement is now driven by ConditionalTokens.mergePositions()
+        //           via subtractOIByCondition hook, gated on ExchangeCLOB's own
+        //           eligibility holdings (transferred in from maker/taker via _update hook).
+        //           Direct-split shares without eligibility do NOT decrement OI — closing
+        //           QGM-03 "Source Tracking" recommendation in the ConditionalTokens layer.
         marketRegistry.addVolume(ctx.marketId, makerPay);
-        marketRegistry.subtractOI(ctx.marketId, amt);
 
         // ── 3. Dust Kill (M-1: by orderHash) ──
         _dustKill(ctx.makerHash, fill.makerOrder.amount);
@@ -664,7 +760,7 @@ contract ExchangeCLOB is
         uint256 takerPay = amt - makerPay;
 
         if (fill.fee > 0) {
-            acc.fees += fill.fee;
+            acc.fees = _checkedAdd(acc.fees, fill.fee);
             // Fee deducted from taker's share (H-1 guard already checked fee <= takerPay)
             takerPay -= fill.fee;
         }
@@ -695,9 +791,25 @@ contract ExchangeCLOB is
         }
     }
 
-    // M-5: Ceil division helper
-    function _ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
-        return a == 0 ? 0 : (a - 1) / b + 1;
+    function _checkedAdd(uint256 a, uint256 b) internal pure returns (uint256) {
+        unchecked {
+            uint256 c = a + b;
+            if (c < a) revert ArithmeticOverflow();
+            return c;
+        }
+    }
+
+    function _canReceiveERC1155(address account) internal view returns (bool) {
+        if (account.code.length == 0) return true;
+
+        (bool success, bytes memory result) = account.staticcall(
+            abi.encodeWithSelector(IERC165.supportsInterface.selector, type(IERC1155Receiver).interfaceId)
+        );
+        return success && result.length >= 32 && abi.decode(result, (bool));
+    }
+
+    function _requireERC1155Receiver(address account) internal view {
+        if (!_canReceiveERC1155(account)) revert ReceiverIncompatible();
     }
 
     // ═══════════════════════════════════════════════════════
@@ -711,11 +823,11 @@ contract ExchangeCLOB is
 
     // L-3: Zero-address checks on setters
     function setFeeCollector(address fc) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(fc != address(0), "Zero address");
+        if (fc == address(0)) revert ZeroAddress();
         feeCollector = fc;
     }
     function setTreasury(address t) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(t != address(0), "Zero address");
+        if (t == address(0)) revert ZeroAddress();
         treasury = t;
     }
 
@@ -814,5 +926,5 @@ contract ExchangeCLOB is
     }
 
     // ─── Storage Gap ───
-    uint256[46] private __gap;
+    uint256[45] private __gap;
 }

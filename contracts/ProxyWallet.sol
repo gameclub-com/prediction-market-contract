@@ -23,7 +23,7 @@ contract ProxyWallet is IERC1271, ERC1155Holder {
     bytes32 public constant EXECUTE_TYPEHASH =
         keccak256("Execute(address target,uint256 value,bytes32 dataHash,uint256 nonce,uint256 deadline)");
     bytes32 public constant EXECUTE_BATCH_TYPEHASH =
-        keccak256("ExecuteBatch(bytes32 targetsHash,bytes32 valuesHash,bytes32 datasHash,uint256 nonce)");
+        keccak256("ExecuteBatch(bytes32 targetsHash,bytes32 valuesHash,bytes32 datasHash,uint256 nonce,uint256 deadline)");
 
     // ─── Storage ───
     address public owner;
@@ -45,6 +45,8 @@ contract ProxyWallet is IERC1271, ERC1155Holder {
 
     // ─── Events ───
     event Executed(address indexed target, uint256 value, bytes data);
+    event ExecutionFailed(uint256 indexed nonce, address indexed target, uint256 value, bytes data, bytes returnData);
+    event BatchExecutionFailed(uint256 indexed nonce, uint256 indexed index, address indexed target, uint256 value, bytes data, bytes returnData);
 
     // L-5 v2: Lock implementation contract (prevent initialization of the template)
     constructor() {
@@ -138,7 +140,10 @@ contract ProxyWallet is IERC1271, ERC1155Holder {
         usedNonces[nonce] = true;
 
         (bool success, bytes memory result) = target.call{value: value}(data);
-        if (!success) revert CallFailed(result);
+        if (!success) {
+            emit ExecutionFailed(nonce, target, value, data, result);
+            return result;
+        }
         emit Executed(target, value, data);
         return result;
     }
@@ -155,18 +160,23 @@ contract ProxyWallet is IERC1271, ERC1155Holder {
         uint256[] calldata values,
         bytes[] calldata datas,
         uint256 nonce,
+        uint256 deadline,
         bytes calldata ownerSignature
     ) external returns (bytes[] memory results) {
         if (usedNonces[nonce]) revert NonceAlreadyUsed();
+        if (deadline > 0 && block.timestamp > deadline) revert DeadlineExpired();
         require(targets.length == values.length && values.length == datas.length, "length mismatch");
 
-        _verifyBatchSignature(targets, values, datas, nonce, ownerSignature);
+        _verifyBatchSignature(targets, values, datas, nonce, deadline, ownerSignature);
         usedNonces[nonce] = true;
 
         results = new bytes[](targets.length);
         for (uint256 i = 0; i < targets.length;) {
             (bool ok, bytes memory res) = targets[i].call{value: values[i]}(datas[i]);
-            if (!ok) revert CallFailed(res);
+            if (!ok) {
+                emit BatchExecutionFailed(nonce, i, targets[i], values[i], datas[i], res);
+                return results;
+            }
             results[i] = res;
             unchecked { i++; }
         }
@@ -178,6 +188,7 @@ contract ProxyWallet is IERC1271, ERC1155Holder {
         uint256[] calldata values,
         bytes[] calldata datas,
         uint256 nonce,
+        uint256 deadline,
         bytes calldata ownerSignature
     ) internal view {
         bytes32 structHash = keccak256(
@@ -186,7 +197,8 @@ contract ProxyWallet is IERC1271, ERC1155Holder {
                 keccak256(abi.encodePacked(targets)),
                 keccak256(abi.encodePacked(values)),
                 _hashBytesArray(datas),
-                nonce
+                nonce,
+                deadline
             )
         );
         address signer = _hashTypedDataV4(structHash).recover(ownerSignature);

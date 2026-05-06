@@ -8,6 +8,12 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+// Option C: forward declaration of MarketRegistry hook interface
+interface IMarketRegistryOIHook {
+    function addOIByCondition(bytes32 conditionId, uint256 oi) external;
+    function subtractOIByCondition(bytes32 conditionId, uint256 oi) external;
+}
+
 /// @title ConditionalTokens — ERC1155 outcome tokens for prediction markets
 /// @notice v2: AccessControl 기반 역할 관리. outcomeSlotCount == 2 only. Gnosis CTF-style.
 contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUpgradeable, UUPSUpgradeable {
@@ -103,6 +109,18 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
     // C-1: Per-condition collateral accounting
     mapping(bytes32 => uint256) public conditionCollateral;
 
+    // ─── Option C: Protocol-wide OI sync (append-only storage) ───
+    /// @notice MarketRegistry address — set via initializeVx(). When set, splitPosition / mergePositions
+    ///         call the registry's OI sync hooks. When unset (zero), hooks are skipped (back-compat).
+    IMarketRegistryOIHook public marketRegistry;
+    /// @notice Per-user, per-positionId eligibility for OI decrement.
+    ///         Granted on splitPosition mint, moved on ERC1155 transfer, burned on mergePositions / redeem.
+    mapping(address => mapping(uint256 => uint256)) public oiEligibleShares;
+
+    // ─── Option C events ───
+    event MarketRegistrySet(address indexed registry);
+    event OIEligibilityMoved(address indexed from, address indexed to, uint256 indexed posId, uint256 amount);
+
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
@@ -135,6 +153,16 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
         _grantRole(DEFAULT_ADMIN_ROLE, _newAdmin);
         // 기존 admin 변수는 storage layout 보존을 위해 건드리지 않음.
         // _authorizeUpgrade가 role 기반으로 변경되었으므로 admin 변수는 더 이상 사용되지 않음.
+    }
+
+    /// @notice V3 (Option C): wire ConditionalTokens to MarketRegistry for protocol-wide OI sync.
+    /// @dev    reinitializer(3) — one-time only. Called after upgrading to V3 implementation.
+    ///         Registry must be set BEFORE splitPosition / mergePositions are called for OI tracking.
+    ///         If skipped, OI sync is silently disabled (back-compat).
+    function initializeVx(address _marketRegistry) external reinitializer(3) {
+        require(_marketRegistry != address(0), "Zero registry");
+        marketRegistry = IMarketRegistryOIHook(_marketRegistry);
+        emit MarketRegistrySet(_marketRegistry);
     }
 
     // ─── UUPS Authorization (V2: role 기반) ───
@@ -201,7 +229,15 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
             }
 
             _mint(msg.sender, posId, amount, "");
+            // Option C: caller of splitPosition gains OI eligibility on the minted shares
+            oiEligibleShares[msg.sender][posId] += amount;
             unchecked { i++; }
+        }
+
+        // Option C: hook into MarketRegistry for protocol-wide OI tracking + maxOI cap
+        // No-op when registry is unset (back-compat) or condition is not registered as a market.
+        if (address(marketRegistry) != address(0)) {
+            marketRegistry.addOIByCondition(conditionId, amount);
         }
 
         emit PositionSplit(msg.sender, conditionId, amount);
@@ -215,10 +251,28 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
         if (conditionOutcomeSlotCounts[conditionId] == 0) revert ConditionNotFound(conditionId);
 
         uint256 outcomeSlotCount = conditionOutcomeSlotCounts[conditionId];
+
+        // Option C: compute OI decrement = min(burnAmount, eligibility on each outcome).
+        // For binary markets (outcomeSlotCount == 2) we burn `amount` of each outcome,
+        // so the OI decrement is bounded by the smaller eligibility across both outcomes.
+        uint256 minEligible = type(uint256).max;
+        for (uint256 i = 0; i < outcomeSlotCount;) {
+            uint256 indexSet = 1 << i;
+            uint256 posId = getPositionId(address(collateralToken), getCollectionId(conditionId, indexSet));
+            uint256 elig = oiEligibleShares[msg.sender][posId];
+            if (elig < minEligible) minEligible = elig;
+            unchecked { i++; }
+        }
+        uint256 oiDecrement = minEligible < amount ? minEligible : amount;
+
         for (uint256 i = 0; i < outcomeSlotCount;) {
             uint256 indexSet = 1 << i;
             uint256 posId = getPositionId(address(collateralToken), getCollectionId(conditionId, indexSet));
             _burn(msg.sender, posId, amount);
+            // Option C: consume eligibility up to oiDecrement
+            if (oiDecrement > 0) {
+                oiEligibleShares[msg.sender][posId] -= oiDecrement;
+            }
             unchecked { i++; }
         }
 
@@ -226,6 +280,11 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
         conditionCollateral[conditionId] -= amount;
 
         collateralToken.safeTransfer(msg.sender, amount);
+
+        // Option C: hook into MarketRegistry — only decrement OI by the eligible portion
+        if (oiDecrement > 0 && address(marketRegistry) != address(0)) {
+            marketRegistry.subtractOIByCondition(conditionId, oiDecrement);
+        }
 
         emit PositionsMerged(msg.sender, conditionId, amount);
     }
@@ -295,6 +354,11 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
             // Rounding floor
             uint256 payout = (bal * payoutNumerator) / den;
 
+            // Option C: clear redeemer's OI eligibility on this position before burn.
+            // Finalized markets have no OI tracking impact, but we keep state consistent.
+            if (oiEligibleShares[msg.sender][posId] > 0) {
+                oiEligibleShares[msg.sender][posId] = 0;
+            }
             // CEI: burn before transfer
             _burn(msg.sender, posId, bal);
 
@@ -410,10 +474,23 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
 
         for (uint256 i = 0; i < ids.length;) {
             if (from == address(0)) {
+                // Mint: totalSupply update only. Eligibility is granted by the caller
+                // of splitPosition (the caller, not the recipient mintee, holds eligibility).
                 _totalSupply[ids[i]] += values[i];
-            }
-            if (to == address(0)) {
+            } else if (to == address(0)) {
+                // Burn: totalSupply update only. Eligibility consumption handled by
+                // mergePositions / redeemPositions / redeemPositionsFor explicitly.
                 _totalSupply[ids[i]] -= values[i];
+            } else {
+                // Option C: regular transfer — move OI eligibility along with shares
+                // up to the lesser of (sender's eligibility, transferred amount).
+                uint256 elig = oiEligibleShares[from][ids[i]];
+                uint256 moved = elig < values[i] ? elig : values[i];
+                if (moved > 0) {
+                    oiEligibleShares[from][ids[i]] = elig - moved;
+                    oiEligibleShares[to][ids[i]] += moved;
+                    emit OIEligibilityMoved(from, to, ids[i], moved);
+                }
             }
             unchecked { i++; }
         }
@@ -426,6 +503,80 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
         return super.supportsInterface(interfaceId);
     }
 
+    // ═══════════════════════════════════════════════════════
+    // ADMIN REDEEM (recover CT shares from proxy wallets)
+    // ═══════════════════════════════════════════════════════
+
+    event RedeemForUser(address indexed holder, address indexed recipient, bytes32 conditionId, uint256 totalPayout);
+
+    /// @notice Redeem CT shares on behalf of a user (proxy wallet).
+    ///         Requires that the holder has approved this contract (isApprovedForAll).
+    ///         Burns the holder's shares and sends USDT payout to the specified recipient.
+    /// @param holder    The address holding CT shares (typically a ProxyWallet)
+    /// @param recipient The address to receive the USDT payout
+    /// @param conditionId The condition to redeem
+    /// @param indexSets  Array of index sets to redeem (e.g., [1] for outcome 0, [2] for outcome 1)
+    function redeemPositionsFor(
+        address holder,
+        address recipient,
+        bytes32 conditionId,
+        uint256[] calldata indexSets
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant returns (uint256 totalPayout) {
+        require(holder != address(0), "Zero holder");
+        require(recipient != address(0), "Zero recipient");
+        if (!isResolved[conditionId]) revert ConditionNotResolved(conditionId);
+
+        uint256 den = payoutDenominator[conditionId];
+        uint256[] memory nums = payoutNumerators[conditionId];
+
+        for (uint256 i = 0; i < indexSets.length;) {
+            uint256 indexSet = indexSets[i];
+            uint256 posId = getPositionId(address(collateralToken), getCollectionId(conditionId, indexSet));
+            uint256 bal = balanceOf(holder, posId);
+
+            if (bal == 0) {
+                unchecked { i++; }
+                continue;
+            }
+
+            uint256 payoutNumerator;
+            for (uint256 j = 0; j < nums.length;) {
+                if (indexSet == (1 << j)) {
+                    payoutNumerator = nums[j];
+                    break;
+                }
+                unchecked { j++; }
+            }
+
+            uint256 payout = (bal * payoutNumerator) / den;
+            // Option C: clear holder's OI eligibility on this position before burn (consistency).
+            if (oiEligibleShares[holder][posId] > 0) {
+                oiEligibleShares[holder][posId] = 0;
+            }
+            _burn(holder, posId, bal);
+            totalPayout += payout;
+            unchecked { i++; }
+        }
+
+        if (totalPayout == 0) return 0;
+
+        conditionCollateral[conditionId] -= totalPayout;
+
+        if (totalPayout < MIN_REDEEM) {
+            collateralToken.safeTransfer(treasury, totalPayout);
+            emit DustToTreasury(holder, conditionId, totalPayout);
+            return 0;
+        }
+
+        assert(totalPayout <= collateralToken.balanceOf(address(this)));
+        collateralToken.safeTransfer(recipient, totalPayout);
+
+        emit RedeemForUser(holder, recipient, conditionId, totalPayout);
+    }
+
     // ─── Storage Gap ───
-    uint256[47] private __gap;
+    // Reduced from 47 → 45 to accommodate Option C storage:
+    //   - IMarketRegistryOIHook marketRegistry                                  (1 slot)
+    //   - mapping(address => mapping(uint256 => uint256)) oiEligibleShares      (1 slot)
+    uint256[45] private __gap;
 }

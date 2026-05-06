@@ -28,6 +28,13 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     error SCDeadlineNotPassed();
     error NotOracleRouter();
     error MarketNotYetResolved(uint256 marketId);
+    error OIUnderflowErr(uint256 marketId, uint256 currentOI, uint256 requestedOI);
+    error CollateralPerSetImmutable(uint256 marketId);
+    // Option C: ConditionalTokens link + protocol-wide OI sync
+    error NotConditionalTokens();
+    error MaxOIExceeded(uint256 marketId, uint256 currentOI, uint256 attempted, uint256 max);
+    error ConditionalTokensAlreadySet();
+    error ConditionIdAlreadyMapped(bytes32 conditionId, uint256 existingMarketId);
 
     // ─── Events ───
     event MarketCreated(
@@ -48,6 +55,12 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     event MarketExpired(uint256 indexed marketId);
     event MarketUnresolved(uint256 indexed marketId);
     event OIUnderflow(uint256 indexed marketId, uint256 currentOI, uint256 subtractedOI);
+    event OIRecovered(uint256 indexed marketId, uint256 oldOI, uint256 newOI, address indexed by);
+    // Option C events
+    event ConditionalTokensSet(address indexed ct);
+    event ConditionalTokensReset(address indexed previousCt, address indexed by);
+    event ConditionIdMapped(uint256 indexed marketId, bytes32 indexed conditionId);
+    event OISynced(uint256 indexed marketId, bytes32 indexed conditionId, int256 delta, uint256 newOI);
     event OracleRouterUpdated(address indexed oldRouter, address indexed newRouter);
     // H-4 v2: 2-step oracle router change events
     event OracleRouterChangeProposed(address indexed newRouter, uint256 executeAfter);
@@ -113,9 +126,18 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     uint256 public oracleRouterChangeTime;
     uint256 public constant ROUTER_CHANGE_DELAY = 24 hours;
 
+    // Option C: protocol-wide OI sync via ConditionalTokens
+    mapping(bytes32 => uint256) public conditionIdToMarketId;
+    address public conditionalTokensAddress;
+
     // ─── Modifiers ───
     modifier onlyOracleRouter() {
         if (msg.sender != oracleRouter) revert NotOracleRouter();
+        _;
+    }
+
+    modifier onlyConditionalTokens() {
+        if (msg.sender != conditionalTokensAddress) revert NotConditionalTokens();
         _;
     }
 
@@ -383,6 +405,12 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
 
         questionIdToMarketId[params.questionId] = marketId;
 
+        // Option C: register conditionId → marketId reverse mapping for OI sync hooks
+        if (conditionIdToMarketId[conditionId] == 0) {
+            conditionIdToMarketId[conditionId] = marketId;
+            emit ConditionIdMapped(marketId, conditionId);
+        }
+
         // Prepare condition in ConditionalTokens (skip if already prepared)
         try conditionalTokens.prepareCondition(address(this), params.questionId, params.outcomeSlotCount) {}
         catch { /* ConditionAlreadyPrepared — safe to ignore */ }
@@ -429,6 +457,7 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         if (!m.exists) revert MarketNotFound(marketId);
         if (!m.resolved) revert MarketNotResolved(marketId);
         if (m.finalized) revert MarketAlreadyFinalized(marketId);
+        if (m.frozen) revert MarketFrozen(marketId);
 
         m.finalized = true;
 
@@ -451,6 +480,7 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         if (!m.exists) revert MarketNotFound(marketId);
         if (!m.resolved) revert MarketNotResolved(marketId);
         if (m.finalized) revert MarketAlreadyFinalized(marketId);
+        if (m.frozen) revert MarketFrozen(marketId);
 
         m.finalized = true;
 
@@ -539,12 +569,90 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         Market storage m = markets[marketId];
         // M-5 v2: Validate market exists
         if (!m.exists) revert MarketNotFound(marketId);
-        if (oi > m.currentOI) {
-            emit OIUnderflow(marketId, m.currentOI, oi);
-            m.currentOI = 0;
-        } else {
-            m.currentOI -= oi;
+        if (oi > m.currentOI) revert OIUnderflowErr(marketId, m.currentOI, oi);
+        m.currentOI -= oi;
+    }
+
+    /// @notice Admin escape hatch — set currentOI directly to reconcile with reality.
+    /// @dev    Used when off-chain operations (direct splits/merges/transfers) cause drift.
+    ///         Does NOT bypass any other security invariant. Only currentOI value.
+    ///         Should be governed by Timelock/Multisig in production.
+    function recoverOI(uint256 marketId, uint256 newOI) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        Market storage m = markets[marketId];
+        if (!m.exists) revert MarketNotFound(marketId);
+        if (m.finalized) revert MarketAlreadyFinalized(marketId);
+        uint256 oldOI = m.currentOI;
+        m.currentOI = newOI;
+        emit OIRecovered(marketId, oldOI, newOI, msg.sender);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // OPTION C: ConditionalTokens-driven OI sync
+    // ═══════════════════════════════════════════════════════
+
+    /// @notice One-time setter for ConditionalTokens address. Required for OI sync hooks.
+    /// @dev    Called once during deployment after both contracts exist.
+    ///         Use emergencyResetConditionalTokens() if reset is required (admin-gated).
+    function setConditionalTokens(address _ct) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (conditionalTokensAddress != address(0)) revert ConditionalTokensAlreadySet();
+        require(_ct != address(0), "Zero CT");
+        conditionalTokensAddress = _ct;
+        emit ConditionalTokensSet(_ct);
+    }
+
+    /// @notice Emergency reset of ConditionalTokens link — for rollback / migration scenarios.
+    /// @dev    Disables OI sync hooks. Operator must re-call setConditionalTokens to re-enable.
+    ///         Should be governed by Timelock/Multisig in production.
+    function emergencyResetConditionalTokens() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        address prev = conditionalTokensAddress;
+        conditionalTokensAddress = address(0);
+        emit ConditionalTokensReset(prev, msg.sender);
+    }
+
+    /// @notice Backfill conditionId → marketId mapping for markets created before Option C.
+    /// @dev    Idempotent — skips already-mapped conditions. Admin-only.
+    function backfillConditionMapping(uint256 marketId) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        Market storage m = markets[marketId];
+        if (!m.exists) revert MarketNotFound(marketId);
+        bytes32 cid = m.conditionId;
+        uint256 existing = conditionIdToMarketId[cid];
+        if (existing == marketId) return; // already mapped, idempotent
+        if (existing != 0) revert ConditionIdAlreadyMapped(cid, existing);
+        conditionIdToMarketId[cid] = marketId;
+        emit ConditionIdMapped(marketId, cid);
+    }
+
+    /// @notice OI increase hook — called by ConditionalTokens.splitPosition().
+    /// @dev    No-ops for unregistered conditions (CT used outside protocol markets).
+    ///         Reverts on maxOpenInterest cap breach.
+    function addOIByCondition(bytes32 conditionId, uint256 oi) external onlyConditionalTokens {
+        if (oi == 0) return;
+        uint256 marketId = conditionIdToMarketId[conditionId];
+        if (marketId == 0) return; // condition not registered as a protocol market
+        Market storage m = markets[marketId];
+        if (!m.exists) return;
+        if (m.resolved) return; // post-resolution mints (QGM-04 guarded elsewhere)
+
+        uint256 newOI = m.currentOI + oi;
+        if (m.maxOpenInterest > 0 && newOI > m.maxOpenInterest) {
+            revert MaxOIExceeded(marketId, m.currentOI, newOI, m.maxOpenInterest);
         }
+        m.currentOI = newOI;
+        emit OISynced(marketId, conditionId, int256(oi), newOI);
+    }
+
+    /// @notice OI decrease hook — called by ConditionalTokens.mergePositions().
+    /// @dev    No-ops for unregistered conditions. Reverts on underflow (exact accounting).
+    function subtractOIByCondition(bytes32 conditionId, uint256 oi) external onlyConditionalTokens {
+        if (oi == 0) return;
+        uint256 marketId = conditionIdToMarketId[conditionId];
+        if (marketId == 0) return;
+        Market storage m = markets[marketId];
+        if (!m.exists) return;
+
+        if (oi > m.currentOI) revert OIUnderflowErr(marketId, m.currentOI, oi);
+        m.currentOI -= oi;
+        emit OISynced(marketId, conditionId, -int256(oi), m.currentOI);
     }
 
     // ─── OracleRouter Integration ───
@@ -566,6 +674,8 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         Market storage m = markets[marketId];
         if (!m.exists) revert MarketNotFound(marketId);
         if (m.finalized) revert MarketAlreadyFinalized(marketId);
+        require(newCutoff > block.timestamp, "Cutoff in past");
+        require(newCutoff <= m.endTime, "Cutoff after end");
         m.tradingCutoff = newCutoff;
     }
 
@@ -589,22 +699,16 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     function setCollateralPerSet(uint256 marketId, uint256 newCps) external onlyRole(DEFAULT_ADMIN_ROLE) {
         Market storage m = markets[marketId];
         if (!m.exists) revert MarketNotFound(marketId);
-        require(newCps == 1e18 || newCps == 1e17 || newCps == 1e16, "Invalid collateralPerSet");
-        uint256 oldCps = m.collateralPerSet;
-        m.collateralPerSet = newCps;
-        emit CollateralPerSetUpdated(marketId, oldCps, newCps);
+        newCps;
+        revert CollateralPerSetImmutable(marketId);
     }
 
     /// @notice Batch update collateralPerSet for multiple markets.
     function batchSetCollateralPerSet(uint256[] calldata marketIds, uint256 newCps) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(newCps == 1e18 || newCps == 1e17 || newCps == 1e16, "Invalid collateralPerSet");
-        for (uint256 i = 0; i < marketIds.length; i++) {
-            Market storage m = markets[marketIds[i]];
-            if (!m.exists) revert MarketNotFound(marketIds[i]);
-            uint256 oldCps = m.collateralPerSet;
-            m.collateralPerSet = newCps;
-            emit CollateralPerSetUpdated(marketIds[i], oldCps, newCps);
-        }
+        newCps;
+        if (marketIds.length == 0) revert MarketNotFound(0);
+        if (!markets[marketIds[0]].exists) revert MarketNotFound(marketIds[0]);
+        revert CollateralPerSetImmutable(marketIds[0]);
     }
 
     // ─── View ───
@@ -632,5 +736,8 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     }
 
     // ─── Storage Gap ───
-    uint256[49] private __gap;
+    // Reduced from 49 → 47 to accommodate Option C storage:
+    //   - mapping(bytes32 => uint256) conditionIdToMarketId  (1 slot)
+    //   - address conditionalTokensAddress                   (1 slot)
+    uint256[47] private __gap;
 }
