@@ -59,11 +59,15 @@ contract SafeProxyFactory {
         bytes32 finalSalt = keccak256(abi.encodePacked(owner, salt));
         proxy = implementation.cloneDeterministic(finalSalt);
 
-        // Encode auto-approve setup data so the proxy grants Exchange
-        // max USDT allowance and ConditionalTokens operator approval.
-        address[] memory targets = new address[](2);
-        uint256[] memory values = new uint256[](2);
-        bytes[] memory datas = new bytes[](2);
+        // Encode auto-approve setup data so the proxy grants:
+        //   [0] USDT max allowance to Exchange (for buy-side settlement debits)
+        //   [1] ERC1155 operator approval to Exchange (for share transfers during fills)
+        //   [2] ERC1155 operator approval to ConditionalTokens itself (QGM-38 fix: enables
+        //       admin `redeemPositionsFor` recovery flow now that the function enforces
+        //       `isApprovedForAll(holder, address(this))`).
+        address[] memory targets = new address[](3);
+        uint256[] memory values = new uint256[](3);
+        bytes[] memory datas = new bytes[](3);
 
         targets[0] = address(usdt);
         values[0] = 0;
@@ -74,6 +78,17 @@ contract SafeProxyFactory {
         datas[1] = abi.encodeWithSelector(
             IERC1155.setApprovalForAll.selector,
             exchange,
+            true
+        );
+
+        // QGM-38 fix: opt-in to admin redeem path at proxy creation. ProxyWallet
+        // approves the ConditionalTokens contract itself as an operator so that
+        // `ConditionalTokens.redeemPositionsFor(...)` can burn the proxy's shares.
+        targets[2] = address(conditionalTokens);
+        values[2] = 0;
+        datas[2] = abi.encodeWithSelector(
+            IERC1155.setApprovalForAll.selector,
+            address(conditionalTokens),
             true
         );
 

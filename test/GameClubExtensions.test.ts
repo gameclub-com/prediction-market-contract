@@ -638,6 +638,11 @@ describe("GameClub: redeemPositionsFor", function () {
   it("redeemPositionsFor sends payout to recipient (not holder)", async function () {
     const { ct, oracleRouter, proposer, alice, charlie, deployer, marketId, conditionId } =
       await loadFixture(deployFixture);
+
+    // QGM-38 fix: holder must opt in to admin redemption via setApprovalForAll(CT, true).
+    const ctAddr = await ct.getAddress();
+    await ct.connect(alice).setApprovalForAll(ctAddr, true);
+
     await oracleRouter.connect(proposer).earlyResolve(marketId, 0);
 
     const usdt = await ethers.getContractAt("MockUSDT", await ct.collateralToken());
@@ -648,6 +653,18 @@ describe("GameClub: redeemPositionsFor", function () {
 
     const charlieUsdtAfter = await usdt.balanceOf(charlie.address);
     expect(charlieUsdtAfter - charlieUsdtBefore).to.equal(ethers.parseEther("5000"));
+  });
+
+  it("QGM-38: redeemPositionsFor reverts when holder has not approved CT", async function () {
+    const { ct, oracleRouter, proposer, alice, deployer, marketId, conditionId } =
+      await loadFixture(deployFixture);
+
+    // Alice deliberately does NOT call setApprovalForAll.
+    await oracleRouter.connect(proposer).earlyResolve(marketId, 0);
+
+    await expect(
+      ct.connect(deployer).redeemPositionsFor(alice.address, alice.address, conditionId, [1])
+    ).to.be.revertedWithCustomError(ct, "HolderApprovalRequired");
   });
 });
 

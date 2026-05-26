@@ -35,6 +35,10 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     error MaxOIExceeded(uint256 marketId, uint256 currentOI, uint256 attempted, uint256 max);
     error ConditionalTokensAlreadySet();
     error ConditionIdAlreadyMapped(bytes32 conditionId, uint256 existingMarketId);
+    // QGM-37 fix: createMarket rejects adoption of pre-prepared official conditions
+    error ConditionPrePrepared(bytes32 conditionId);
+    // QGM-40 fix: explicit error for lifecycle calls when CT reference is unset
+    error ConditionalTokensNotSet();
 
     // ─── Events ───
     event MarketCreated(
@@ -411,9 +415,14 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
             emit ConditionIdMapped(marketId, conditionId);
         }
 
-        // Prepare condition in ConditionalTokens (skip if already prepared)
-        try conditionalTokens.prepareCondition(address(this), params.questionId, params.outcomeSlotCount) {}
-        catch { /* ConditionAlreadyPrepared — safe to ignore */ }
+        // QGM-37 fix: reject pre-prepared official conditions. Combined with
+        //   ConditionalTokens.prepareCondition()'s registry-only gate, this guarantees
+        //   that protocol conditions cannot exist before createMarket maps them.
+        //   Therefore no untracked split/supply can hide under an official conditionId.
+        if (conditionalTokens.conditionOutcomeSlotCounts(conditionId) != 0) {
+            revert ConditionPrePrepared(conditionId);
+        }
+        conditionalTokens.prepareCondition(address(this), params.questionId, params.outcomeSlotCount);
 
         emit MarketCreated(
             marketId,
@@ -447,6 +456,10 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         if (!m.exists) revert MarketNotFound(marketId);
         if (m.finalized) revert MarketAlreadyFinalized(marketId);
         if (m.resolved) revert MarketAlreadyResolved(marketId);
+        // QGM-39 fix: frozen markets cannot enter resolved state. This keeps
+        // setResolved consistent with finalizeResolution / finalizeResolutionInvalid
+        // and prevents the "PROPOSED but un-finalizable" stuck intermediate state.
+        if (m.frozen) revert MarketFrozen(marketId);
 
         m.resolved = true;
         emit MarketResolved(marketId);
@@ -463,6 +476,8 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
 
         // NCA: Report payouts to ConditionalTokens so shares can be redeemed
         // Oracle = address(this) because prepareCondition was called with address(this)
+        // QGM-40 fix: explicit guard with clear error instead of silent zero-address call.
+        if (address(conditionalTokens) == address(0)) revert ConditionalTokensNotSet();
         uint256[] memory payouts = new uint256[](2);
         payouts[outcomeIndex] = 1;
         conditionalTokens.reportPayouts(m.questionId, payouts);
@@ -484,6 +499,8 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
 
         m.finalized = true;
 
+        // QGM-40 fix: explicit guard with clear error instead of silent zero-address call.
+        if (address(conditionalTokens) == address(0)) revert ConditionalTokensNotSet();
         uint256[] memory payouts = new uint256[](2);
         payouts[0] = 1;
         payouts[1] = 1;
@@ -518,17 +535,23 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
 
     /// @notice Expire a market — resolves as INVALID (50:50 refund) so users can redeem.
     /// @dev MED-4 fix: also finalizes and reports payouts to CT.
+    ///      QGM-42 fix: frozen markets cannot be auto-expired. Council must explicitly
+    ///      unfreezeMarket() first. This is consistent with finalize* paths and prevents
+    ///      keeper from forcing a 50/50 INVALID outcome during an active emergency pause.
     function expireMarket(uint256 marketId) external onlyRole(Roles.KEEPER_ROLE) {
         Market storage m = markets[marketId];
         if (!m.exists) revert MarketNotFound(marketId);
         if (m.finalized) revert MarketAlreadyFinalizedErr(marketId);
         if (m.resolved) revert MarketAlreadyResolved(marketId);
+        if (m.frozen) revert MarketFrozen(marketId);
         require(block.timestamp > m.endTime, "Market not expired yet");
 
         m.resolved = true;
         m.finalized = true;
 
         // INVALID result: 50/50 split so users can redeem half their collateral
+        // QGM-40 fix: explicit guard with clear error instead of silent zero-address call.
+        if (address(conditionalTokens) == address(0)) revert ConditionalTokensNotSet();
         uint256[] memory payouts = new uint256[](2);
         payouts[0] = 1;
         payouts[1] = 1;
@@ -593,24 +616,36 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     /// @notice One-time setter for ConditionalTokens address. Required for OI sync hooks.
     /// @dev    Called once during deployment after both contracts exist.
     ///         Use emergencyResetConditionalTokens() if reset is required (admin-gated).
+    ///         QGM-40 fix: updates BOTH `conditionalTokens` (lifecycle reference) and
+    ///         `conditionalTokensAddress` (OI hook authorization) atomically to prevent
+    ///         split-brain operation.
     function setConditionalTokens(address _ct) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (conditionalTokensAddress != address(0)) revert ConditionalTokensAlreadySet();
         require(_ct != address(0), "Zero CT");
         conditionalTokensAddress = _ct;
+        conditionalTokens = ConditionalTokens(_ct);
         emit ConditionalTokensSet(_ct);
     }
 
     /// @notice Emergency reset of ConditionalTokens link — for rollback / migration scenarios.
-    /// @dev    Disables OI sync hooks. Operator must re-call setConditionalTokens to re-enable.
-    ///         Should be governed by Timelock/Multisig in production.
+    /// @dev    Disables OI sync hooks AND lifecycle calls. Operator must re-call
+    ///         setConditionalTokens to re-enable.
+    ///         QGM-40 fix: clears BOTH references atomically; lifecycle functions
+    ///         (`finalizeResolution`, `finalizeResolutionInvalid`, `expireMarket`)
+    ///         will revert with `ConditionalTokensNotSet` until re-wired.
     function emergencyResetConditionalTokens() external onlyRole(DEFAULT_ADMIN_ROLE) {
         address prev = conditionalTokensAddress;
         conditionalTokensAddress = address(0);
+        conditionalTokens = ConditionalTokens(address(0));
         emit ConditionalTokensReset(prev, msg.sender);
     }
 
     /// @notice Backfill conditionId → marketId mapping for markets created before Option C.
     /// @dev    Idempotent — skips already-mapped conditions. Admin-only.
+    ///         QGM-03 fix: reconciles pre-existing supply into `currentOI` at backfill time.
+    ///         For binary markets, `totalSupply(outcome 0)` reflects the live OI floor —
+    ///         any complete set ever minted contributes equal supply to both outcomes.
+    ///         Reverts if pre-existing supply exceeds the market's `maxOpenInterest`.
     function backfillConditionMapping(uint256 marketId) external onlyRole(DEFAULT_ADMIN_ROLE) {
         Market storage m = markets[marketId];
         if (!m.exists) revert MarketNotFound(marketId);
@@ -618,6 +653,24 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         uint256 existing = conditionIdToMarketId[cid];
         if (existing == marketId) return; // already mapped, idempotent
         if (existing != 0) revert ConditionIdAlreadyMapped(cid, existing);
+
+        // QGM-03 fix: reconcile pre-existing supply before activating the mapping.
+        // Without this, any condition that was split before backfill would have live
+        // outcome tokens that bypass currentOI tracking and maxOpenInterest enforcement.
+        if (conditionalTokensAddress != address(0)) {
+            ConditionalTokens ct = ConditionalTokens(conditionalTokensAddress);
+            bytes32 collectionId0 = ct.getCollectionId(cid, 1);
+            uint256 posId0 = ct.getPositionId(address(ct.collateralToken()), collectionId0);
+            uint256 existingSupply = ct.totalSupply(posId0);
+            if (existingSupply > 0) {
+                if (m.maxOpenInterest > 0 && existingSupply > m.maxOpenInterest) {
+                    revert MaxOIExceeded(marketId, 0, existingSupply, m.maxOpenInterest);
+                }
+                m.currentOI = existingSupply;
+                emit OISynced(marketId, cid, int256(existingSupply), existingSupply);
+            }
+        }
+
         conditionIdToMarketId[cid] = marketId;
         emit ConditionIdMapped(marketId, cid);
     }
@@ -695,7 +748,9 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
 
     event CollateralPerSetUpdated(uint256 indexed marketId, uint256 oldCps, uint256 newCps);
 
-    /// @notice Update collateralPerSet for an existing market.
+    /// @notice DEPRECATED — collateralPerSet is immutable after market creation. Always reverts.
+    /// @dev    Retained for ABI back-compat. Use a new market for different CPS values.
+    /// @custom:deprecated since v3 (QGM-29). Will be removed in a future ABI-breaking release.
     function setCollateralPerSet(uint256 marketId, uint256 newCps) external onlyRole(DEFAULT_ADMIN_ROLE) {
         Market storage m = markets[marketId];
         if (!m.exists) revert MarketNotFound(marketId);
@@ -703,7 +758,8 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         revert CollateralPerSetImmutable(marketId);
     }
 
-    /// @notice Batch update collateralPerSet for multiple markets.
+    /// @notice DEPRECATED — see `setCollateralPerSet`. Always reverts.
+    /// @custom:deprecated since v3 (QGM-29).
     function batchSetCollateralPerSet(uint256[] calldata marketIds, uint256 newCps) external onlyRole(DEFAULT_ADMIN_ROLE) {
         newCps;
         if (marketIds.length == 0) revert MarketNotFound(0);

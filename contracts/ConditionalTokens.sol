@@ -29,6 +29,10 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
     error ZeroAmount();
     error PayoutBelowMinRedeem(uint256 payout, uint256 minRedeem);
     error InvalidOracleAddress();
+    // QGM-37 fix: gate for protocol-owned conditions
+    error OnlyRegistryForOfficialCondition();
+    // QGM-38 fix: holder approval enforcement
+    error HolderApprovalRequired(address holder);
 
     // ─── Events ───
     event ConditionPrepared(
@@ -190,6 +194,12 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
         if (oracle == address(0)) revert InvalidOracleAddress();
         if (outcomeSlotCount != 2) revert InvalidOutcomeSlotCount(outcomeSlotCount);
 
+        // QGM-37 fix: official conditions (oracle == MarketRegistry) can only be prepared by the registry.
+        // Non-protocol conditions (different oracle) remain permissionless for Gnosis-CTF style usage.
+        if (address(marketRegistry) != address(0) && oracle == address(marketRegistry)) {
+            if (msg.sender != address(marketRegistry)) revert OnlyRegistryForOfficialCondition();
+        }
+
         bytes32 conditionId = getConditionId(oracle, questionId, outcomeSlotCount);
         if (conditionOutcomeSlotCounts[conditionId] != 0) {
             revert ConditionAlreadyPrepared(conditionId);
@@ -207,7 +217,10 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
     function splitPosition(
         bytes32 conditionId,
         uint256 amount
-    ) external {
+    ) external nonReentrant {
+        // QGM-36 fix: nonReentrant added — _mint triggers ERC1155 receiver hook which
+        // previously allowed reentrant mergePositions() to read stale oiEligibleShares
+        // and bypass OI decrement, leading to currentOI inflation.
         if (amount == 0) revert ZeroAmount();
         if (conditionOutcomeSlotCounts[conditionId] == 0) revert ConditionNotFound(conditionId);
         if (isResolved[conditionId]) revert ConditionAlreadyResolved(conditionId);
@@ -228,9 +241,11 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
                 positionIndexSet[posId] = indexSet;
             }
 
-            _mint(msg.sender, posId, amount, "");
-            // Option C: caller of splitPosition gains OI eligibility on the minted shares
+            // QGM-36 fix (CEI): grant OI eligibility BEFORE _mint so the receiver hook
+            // cannot observe a half-initialized state where some outcomes have eligibility
+            // and others don't.
             oiEligibleShares[msg.sender][posId] += amount;
+            _mint(msg.sender, posId, amount, "");
             unchecked { i++; }
         }
 
@@ -246,7 +261,8 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
     function mergePositions(
         bytes32 conditionId,
         uint256 amount
-    ) external {
+    ) external nonReentrant {
+        // QGM-36 fix: nonReentrant added (defense in depth alongside CEI).
         if (amount == 0) revert ZeroAmount();
         if (conditionOutcomeSlotCounts[conditionId] == 0) revert ConditionNotFound(conditionId);
 
@@ -268,11 +284,13 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
         for (uint256 i = 0; i < outcomeSlotCount;) {
             uint256 indexSet = 1 << i;
             uint256 posId = getPositionId(address(collateralToken), getCollectionId(conditionId, indexSet));
-            _burn(msg.sender, posId, amount);
-            // Option C: consume eligibility up to oiDecrement
+            // QGM-36 fix (CEI): consume eligibility BEFORE _burn so the burn observes
+            // the post-decrement state. (Burn itself doesn't trigger receiver hook, but
+            // keeping CEI consistent across split/merge simplifies the mental model.)
             if (oiDecrement > 0) {
                 oiEligibleShares[msg.sender][posId] -= oiDecrement;
             }
+            _burn(msg.sender, posId, amount);
             unchecked { i++; }
         }
 
@@ -281,8 +299,10 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
 
         collateralToken.safeTransfer(msg.sender, amount);
 
-        // Option C: hook into MarketRegistry — only decrement OI by the eligible portion
-        if (oiDecrement > 0 && address(marketRegistry) != address(0)) {
+        // QGM-43 fix: skip OI hook after resolution to keep finalized-market OI immutable.
+        // addOIByCondition() already has an `if (m.resolved) return;` early-exit; this
+        // restores symmetry on the decrement side.
+        if (oiDecrement > 0 && !isResolved[conditionId] && address(marketRegistry) != address(0)) {
             marketRegistry.subtractOIByCondition(conditionId, oiDecrement);
         }
 
@@ -512,6 +532,9 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
     /// @notice Redeem CT shares on behalf of a user (proxy wallet).
     ///         Requires that the holder has approved this contract (isApprovedForAll).
     ///         Burns the holder's shares and sends USDT payout to the specified recipient.
+    /// @dev    QGM-38 fix: now enforces the documented `isApprovedForAll` requirement.
+    ///         SafeProxyFactory grants this approval automatically at ProxyWallet creation;
+    ///         legacy proxies must be backfilled via scripts/backfill-proxy-ct-approval.ts.
     /// @param holder    The address holding CT shares (typically a ProxyWallet)
     /// @param recipient The address to receive the USDT payout
     /// @param conditionId The condition to redeem
@@ -525,6 +548,8 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
         require(holder != address(0), "Zero holder");
         require(recipient != address(0), "Zero recipient");
         if (!isResolved[conditionId]) revert ConditionNotResolved(conditionId);
+        // QGM-38 fix: enforce documented approval — holder must have setApprovalForAll(this, true).
+        if (!isApprovedForAll(holder, address(this))) revert HolderApprovalRequired(holder);
 
         uint256 den = payoutDenominator[conditionId];
         uint256[] memory nums = payoutNumerators[conditionId];

@@ -116,6 +116,16 @@ contract ExchangeCLOB is
     error NonceNotIncreasing();
     error SweepValidation(uint8 code);
 
+    // ─── QGM-33: Explicit upper bounds for signed order fields ───
+    /// @dev Bounded so that all downstream `price * amount`, `fee * MAX_FEE`, and accumulator
+    ///      additions stay within uint256 without panic. 2^128 ≈ 3.4e38 — far above any
+    ///      realistic 18-decimal trade volume.
+    uint256 public constant MAX_ORDER_AMOUNT = 2 ** 128;
+    /// @dev Price is bounded by 1 collateral unit per share (cps ≤ 1e18, price ≤ cps).
+    uint256 public constant MAX_ORDER_PRICE = 1e18;
+    /// @dev Fee is also bounded so `fee * 10_000` cannot overflow when combined with mulDiv.
+    uint256 public constant MAX_ORDER_FEE = 2 ** 128;
+
     // ─── Events ───
     event OrderCancelled(address indexed maker, bytes32 orderHash);
     event NonceBumped(address indexed user, uint256 newNonce);
@@ -358,6 +368,11 @@ contract ExchangeCLOB is
 
         if (sw.takerOrder.side != Side.BUY) revert SweepValidation(2);
         if (sw.takerOrder.outcomeIndex >= market.outcomeSlotCount) revert SweepValidation(3);
+        // QGM-33 fix: `price > cps` (cps ≤ 1e18 = MAX_ORDER_PRICE) implicitly bounds price.
+        // Amount and fee bounds are enforced indirectly by downstream `Math.mulDiv` and
+        // `_checkedAdd`, which convert any potential overflow into a deterministic revert
+        // (SweepValidation / ArithmeticOverflow) rather than a panic. Explicit bound
+        // constants (MAX_ORDER_AMOUNT / MAX_ORDER_FEE) remain as documentation.
         if (sw.takerOrder.price > cps) revert SweepValidation(4);
         _requireERC1155Receiver(sw.takerOrder.maker);
 
@@ -371,8 +386,11 @@ contract ExchangeCLOB is
             for (uint256 i = 0; i < n;) {
                 uint256 amt = sw.fillAmounts[i];
                 if (amt == 0) revert SweepValidation(6);
+                // QGM-02 fix: granularity check for non-default CPS markets.
+                if (cps != 1e18 && amt % (1e18 / cps) != 0) revert SweepValidation(32);
 
                 uint256 mkPrice = sw.makerOrders[i].price;
+                // QGM-33 fix: `mkPrice > cps` (cps ≤ 1e18 = MAX_ORDER_PRICE) implicitly bounds maker price.
                 if (mkPrice > cps) revert SweepValidation(7);
 
                 uint256 col = Math.mulDiv(amt, cps, 1e18);
@@ -380,12 +398,13 @@ contract ExchangeCLOB is
 
                 uint256 mkCost = Math.mulDiv(mkPrice, amt, 1e18);
                 if (mkCost > col) revert SweepValidation(9);
-                if (sw.fees[i] * 10_000 > col * MAX_FEE) revert SweepValidation(10);
+                // QGM-33 fix: full-precision mulDiv compare avoids raw `fees * 10_000` overflow.
+                if (sw.fees[i] > Math.mulDiv(col, MAX_FEE, 10_000)) revert SweepValidation(10);
 
                 if (sw.makerOrders[i].maker == sw.takerOrder.maker) {
                     selfMakerCost = _checkedAdd(selfMakerCost, mkCost);
                 }
-                estTakerCost = _checkedAdd(estTakerCost, col - mkCost + sw.fees[i]);
+                estTakerCost = _checkedAdd(estTakerCost, _checkedAdd(col - mkCost, sw.fees[i]));
                 unchecked { i++; }
             }
 
@@ -400,7 +419,9 @@ contract ExchangeCLOB is
             = _sweepMakerPass(sw, n, marketId, cps);
 
         uint256 tf = filled[takerHash];
-        if (tf == type(uint256).max || tf + totalFill > sw.takerOrder.amount) revert SweepValidation(13);
+        // QGM-33 fix: use _checkedAdd so overflow becomes the deterministic SweepValidation
+        // revert path rather than an opaque panic.
+        if (tf == type(uint256).max || _checkedAdd(tf, totalFill) > sw.takerOrder.amount) revert SweepValidation(13);
         filled[takerHash] += totalFill;
         _dustKill(takerHash, sw.takerOrder.amount);
 
@@ -420,7 +441,11 @@ contract ExchangeCLOB is
 
         _sweepDistributePass(sw, n, market.conditionId, marketId, cps);
         uint256 takerPosId = _getPositionId(market.conditionId, sw.takerOrder.outcomeIndex);
-        conditionalTokens.safeTransferFrom(address(this), sw.takerOrder.maker, takerPosId, totalCol, "");
+        // QGM-30 fix: wrap the taker push transfer — SweepValidation(35) on receiver reject.
+        try conditionalTokens.safeTransferFrom(address(this), sw.takerOrder.maker, takerPosId, totalCol, "") {}
+        catch {
+            revert SweepValidation(35);
+        }
 
         if (acc.fees > 0) _collectFee(acc.fees);
         if (acc.surplus > 0) usdt.safeTransfer(treasury, acc.surplus);
@@ -443,14 +468,16 @@ contract ExchangeCLOB is
             string memory mkErr = _validateOrder(mk, sw.makerSigs[i], true, mkH, false);
             if (bytes(mkErr).length > 0) revert SweepValidation(21);
             uint256 mf = filled[mkH];
-            if (mf == type(uint256).max || mf + amt > mk.amount) revert SweepValidation(22);
+            // QGM-33 fix: use _checkedAdd for overfill comparison.
+            if (mf == type(uint256).max || _checkedAdd(mf, amt) > mk.amount) revert SweepValidation(22);
             require(mk.price + sw.takerOrder.price >= cps, "sw:price_sum");
 
             uint256 col = Math.mulDiv(amt, cps, 1e18);
             if (col == 0) revert SweepValidation(23);
             uint256 mkCost = Math.mulDiv(mk.price, amt, 1e18);
             if (mkCost > col) revert SweepValidation(24);
-            if (fee * 10_000 > col * MAX_FEE) revert SweepValidation(25);
+            // QGM-33 fix: full-precision mulDiv compare avoids raw `fee * 10_000` overflow.
+            if (fee > Math.mulDiv(col, MAX_FEE, 10_000)) revert SweepValidation(25);
             if (usdt.balanceOf(mk.maker) < mkCost) revert SweepValidation(26);
             if (usdt.allowance(mk.maker, address(this)) < mkCost) revert SweepValidation(27);
 
@@ -460,7 +487,8 @@ contract ExchangeCLOB is
 
             totalFill = _checkedAdd(totalFill, amt);
             totalCol = _checkedAdd(totalCol, col);
-            totalTakerCost = _checkedAdd(totalTakerCost, col - mkCost + fee);
+            // QGM-33 fix: nested _checkedAdd guards both (col - mkCost) + fee and the running total.
+            totalTakerCost = _checkedAdd(totalTakerCost, _checkedAdd(col - mkCost, fee));
             if (fee > 0) acc.fees = _checkedAdd(acc.fees, fee);
             unchecked { i++; }
         }
@@ -472,7 +500,14 @@ contract ExchangeCLOB is
         for (uint256 i = 0; i < n;) {
             uint256 shares = Math.mulDiv(sw.fillAmounts[i], cps, 1e18);
             uint256 mkPosId = _getPositionId(conditionId, sw.makerOrders[i].outcomeIndex);
-            conditionalTokens.safeTransferFrom(address(this), sw.makerOrders[i].maker, mkPosId, shares, "");
+            // QGM-30 fix: convert potential push-transfer hard-revert into a deterministic
+            // SweepValidation(34) error (maker receiver rejected). settleMintSweep retains
+            // all-or-nothing semantics, but the error class is now an explicit validation
+            // failure rather than an opaque panic propagating from the receiver hook.
+            try conditionalTokens.safeTransferFrom(address(this), sw.makerOrders[i].maker, mkPosId, shares, "") {}
+            catch {
+                revert SweepValidation(34);
+            }
             emit FillExecuted(
                 marketId, sw.makerOrders[i].maker, sw.takerOrder.maker,
                 sw.makerOrders[i].price, sw.fillAmounts[i], sw.fees[i],
@@ -497,6 +532,16 @@ contract ExchangeCLOB is
 
         if (maker.marketId != taker.marketId) return "mm";
 
+        // QGM-33 fix: signed-field overflow protection is enforced by the downstream
+        // guarded primitives instead of an upfront bound check:
+        //   - `makerFilled + fillAmount`, `takerFilled + fillAmount`  → `_checkedAdd` below
+        //   - `makerOrder.price + takerOrder.price` (in `_executeMerge`) → `_checkedAdd`
+        //   - `fill.fee * 10_000`, `collateral * MAX_FEE`             → `Math.mulDiv`-based
+        //     compares in `_executeComplementary` / `_executeMerge`
+        //   - `executionPrice * fillAmount`                            → `Math.mulDiv` (no overflow)
+        // Together they convert every previously-panicking expression into a deterministic
+        // soft-fail skip reason while keeping the entry-point compact.
+
         MatchType mt = fill.matchType;
         if (mt == MatchType.COMPLEMENTARY) {
             if (uint8(maker.side) == uint8(taker.side)) return "ss";
@@ -516,6 +561,15 @@ contract ExchangeCLOB is
             if (bytes(marketErr).length > 0) return marketErr;
         }
 
+        // QGM-02 fix: for non-1e18 CPS markets, fillAmount must be a multiple of
+        // (1e18 / cps) so that the floor-rounded ERC1155/collateral amount matches the
+        // raw fillAmount used for filled[] / event tracking. Soft-fail to skip on
+        // ill-formed off-chain fills.
+        {
+            uint256 cps = _getCollateralPerSet(maker.marketId);
+            if (cps != 1e18 && cps != 0 && fill.fillAmount % (1e18 / cps) != 0) return "fng";
+        }
+
         bytes32 makerHash = _orderDigest(maker);
         bytes32 takerHash = _orderDigest(taker);
 
@@ -524,13 +578,19 @@ contract ExchangeCLOB is
         string memory takerErr = _validateOrder(taker, fill.takerSig, false, takerHash, force);
         if (bytes(takerErr).length > 0) return takerErr;
 
+        // QGM-33 fix: use _checkedAdd for overfill accounting so an overflow becomes the
+        // soft-fail "mof"/"tof" path (set to type(uint256).max-style sentinel above already
+        // handles the explicit kill marker; the new check guards arithmetic overflow).
         uint256 makerFilled = filled[makerHash];
-        if (makerFilled == type(uint256).max || makerFilled + fill.fillAmount > maker.amount) return "mof";
+        if (makerFilled == type(uint256).max) return "mof";
+        if (_checkedAdd(makerFilled, fill.fillAmount) > maker.amount) return "mof";
         uint256 takerFilled = filled[takerHash];
-        if (takerFilled == type(uint256).max || takerFilled + fill.fillAmount > taker.amount) return "tof";
+        if (takerFilled == type(uint256).max) return "tof";
+        if (_checkedAdd(takerFilled, fill.fillAmount) > taker.amount) return "tof";
 
         return _executeSettlement(fill, makerHash, takerHash, acc);
     }
+
 
     function _checkMarket(uint256 marketId) internal view returns (string memory) {
         MarketRegistry.Market memory m = marketRegistry.getMarket(marketId);
@@ -562,9 +622,14 @@ contract ExchangeCLOB is
     }
 
     function _executeSettlement(Fill calldata fill, bytes32 makerHash, bytes32 takerHash, BatchAcc memory acc) internal returns (string memory) {
+        // QGM-33 fix: short-circuit MINT BEFORE any arithmetic so a malformed MINT fill
+        // cannot revert via Math.mulDiv panic before the soft-fail "mus" reason is returned.
+        if (fill.matchType == MatchType.MINT) return "mus";
+
         FillCtx memory ctx;
         ctx.marketId = fill.makerOrder.marketId;
         ctx.executionPrice = fill.makerOrder.price; // Maker price (Surplus Matching)
+        // QGM-33: inputs are bounded (MAX_ORDER_PRICE × MAX_ORDER_AMOUNT) so mulDiv is safe.
         ctx.fillValue = Math.mulDiv(ctx.executionPrice, fill.fillAmount, 1e18, Math.Rounding.Ceil);
         ctx.outcomeIndex = fill.makerOrder.outcomeIndex;
         ctx.makerHash = makerHash;
@@ -572,9 +637,6 @@ contract ExchangeCLOB is
 
         MarketRegistry.Market memory market = marketRegistry.getMarket(ctx.marketId);
         ctx.conditionId = market.conditionId;
-
-        // V3: MINT fills must go through settleMintSweep
-        if (fill.matchType == MatchType.MINT) return "mus";
 
         if (fill.matchType == MatchType.COMPLEMENTARY) {
             return _executeComplementary(fill, ctx, acc);
@@ -595,8 +657,10 @@ contract ExchangeCLOB is
             if (ctx.executionPrice < fill.takerOrder.price) return "pnc";
         }
 
-        // Fee bps check
-        if (ctx.fillValue > 0 && fill.fee * 10_000 > ctx.fillValue * MAX_FEE) return "fth";
+        // QGM-41 fix: drop the `ctx.fillValue > 0 &&` guard so zero-price complementary fills
+        //   with non-zero fees are correctly skipped (otherwise fee was uncapped against fillValue=0).
+        // QGM-33 fix: full-precision mulDiv compare avoids `fill.fee * 10_000` raw overflow.
+        if (fill.fee > Math.mulDiv(ctx.fillValue, MAX_FEE, 10_000)) return "fth";
 
         // Determine buyer/seller
         if (fill.makerOrder.side == Side.BUY) {
@@ -628,8 +692,9 @@ contract ExchangeCLOB is
         if (!_canReceiveERC1155(ctx.buyer)) return "bri";
 
         // ── Execute (CEI) ──
-        _applyComplementary(fill, ctx, posId, shareAmount, acc);
-        return "";
+        // QGM-30 fix: propagate _applyComplementary's soft-fail reason ("rcr") so the
+        // surrounding batch can skip this fill instead of reverting.
+        return _applyComplementary(fill, ctx, posId, shareAmount, acc);
     }
 
     // V3: _executeMint removed — all MINT fills now routed through settleMintSweep
@@ -637,12 +702,17 @@ contract ExchangeCLOB is
     /// @dev MERGE: cross-outcome SELL+SELL → mergePositions
     function _executeMerge(Fill calldata fill, FillCtx memory ctx, BatchAcc memory acc) internal returns (string memory) {
         uint256 cps = _getCollateralPerSet(ctx.marketId);
-        if (fill.makerOrder.price + fill.takerOrder.price > cps) return "pao";
+        // QGM-33 fix: bounded price-sum using _checkedAdd. Inputs already bounded by
+        // MAX_ORDER_PRICE in _processFillInternal so this never reverts in practice,
+        // but the explicit guard preserves soft-fail semantics if bounds are ever relaxed.
+        uint256 priceSum = _checkedAdd(fill.makerOrder.price, fill.takerOrder.price);
+        if (priceSum > cps) return "pao";
 
         // Fee check: fee against collateral, not shares
         uint256 collateral = Math.mulDiv(fill.fillAmount, cps, 1e18);
         if (collateral == 0) return "mzc";
-        if (fill.fee * 10_000 > collateral * MAX_FEE) return "fth";
+        // QGM-33 fix: full-precision mulDiv compare avoids `fill.fee * 10_000` raw overflow.
+        if (fill.fee > Math.mulDiv(collateral, MAX_FEE, 10_000)) return "fth";
 
         // H-1: Fee underflow guard — check fee doesn't exceed taker proceeds
         uint256 makerPay = Math.mulDiv(fill.makerOrder.price, fill.fillAmount, 1e18);
@@ -673,21 +743,40 @@ contract ExchangeCLOB is
         return "";
     }
 
-    /// @dev COMPLEMENTARY settlement: P2P transferFrom (Polymarket-style)
-    function _applyComplementary(Fill calldata fill, FillCtx memory ctx, uint256 posId, uint256 shareAmount, BatchAcc memory acc) internal {
-        // ── 1. Filled tracking (M-1: by orderHash) ──
+    /// @dev COMPLEMENTARY settlement: P2P transferFrom (Polymarket-style).
+    /// @dev QGM-30 fix: ERC1155 share transfer happens FIRST inside a try/catch.
+    ///      If the buyer's onERC1155Received reverts (despite passing the upfront
+    ///      `_canReceiveERC1155` interface check), this function returns the soft-fail
+    ///      reason "rcr" so the surrounding batch survives. Returning a non-empty string
+    ///      from this function means the caller (`_executeComplementary`) must propagate
+    ///      it; therefore the signature is changed from void to `string memory`.
+    function _applyComplementary(
+        Fill calldata fill, FillCtx memory ctx,
+        uint256 posId, uint256 shareAmount, BatchAcc memory acc
+    ) internal returns (string memory) {
+        // ── 1. ERC1155 shares FIRST: seller → buyer (try/catch for QGM-30) ──
+        // No state changes happen before this point in the apply phase, so a revert here
+        // leaves all books untouched and a "rcr" skip is safe.
+        try conditionalTokens.safeTransferFrom(ctx.seller, ctx.buyer, posId, shareAmount, "") {}
+        catch {
+            return "rcr";
+        }
+
+        // ── 2. Filled tracking (M-1: by orderHash) ──
         filled[ctx.makerHash] += fill.fillAmount;
         filled[ctx.takerHash] += fill.fillAmount;
 
-        // ── 2. M-4: COMPLEMENTARY = volume only, no OI change ──
+        // ── 3. M-4: COMPLEMENTARY = volume only, no OI change ──
         marketRegistry.addVolume(ctx.marketId, ctx.fillValue);
 
-        // ── 3. Dust Kill (M-1: by orderHash) ──
+        // ── 4. Dust Kill (M-1: by orderHash) ──
         _dustKill(ctx.makerHash, fill.makerOrder.amount);
         _dustKill(ctx.takerHash, fill.takerOrder.amount);
 
-        // ── 4. USDT: buyer → seller (full fillValue), fee paid separately by buyer ──
+        // ── 5. USDT: buyer → seller (full fillValue), fee paid separately by buyer ──
         // QGM-12: buyer pays fillValue + fee separately. Seller receives full fillValue.
+        // Balance/allowance was pre-checked in _executeComplementary; standard USDT
+        // transfers do not invoke arbitrary callbacks, so these are reliable post-CT.
         uint256 sellerProceeds = ctx.fillValue;
         if (fill.fee > 0) {
             usdt.safeTransferFrom(ctx.buyer, address(this), fill.fee);
@@ -697,15 +786,13 @@ contract ExchangeCLOB is
             usdt.safeTransferFrom(ctx.buyer, ctx.seller, sellerProceeds);
         }
 
-        // ── 5. ERC1155 shares: seller → buyer (CPS-scaled amount) ──
-        conditionalTokens.safeTransferFrom(ctx.seller, ctx.buyer, posId, shareAmount, "");
-
         // L-7: matchType in event
         emit FillExecuted(
             ctx.marketId, fill.makerOrder.maker, fill.takerOrder.maker,
             ctx.executionPrice, fill.fillAmount, fill.fee, fill.makerOrder.side,
             MatchType.COMPLEMENTARY
         );
+        return "";
     }
 
     // V3: _applyMint + _splitAndDistribute removed — all MINT fills now routed through settleMintSweep

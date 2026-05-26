@@ -31,6 +31,8 @@ contract CentralizedOracleRouter is
     error DisputeWindowExpired(uint256 marketId);
     error InvalidOutcome(uint256 outcomeIndex);
     error ZeroAddress();
+    // QGM-39 fix: router-level frozen guard for _proposeOutcome / _earlyResolve
+    error MarketFrozen(uint256 marketId);
 
     // ─── Events (implementation-specific, beyond IOracleRouter) ───
     event EmergencyRejected(uint256 indexed marketId, address indexed rejectedBy);
@@ -113,10 +115,20 @@ contract CentralizedOracleRouter is
     }
 
     /// @dev Internal propose logic shared by proposeOutcome and proposeOutcomeBatch.
+    /// @dev Intent (QGM-44): `tradingCutoff` is treated as a valid resolution gate in addition
+    ///      to a trading halt. Markets created with `cutoff < endTime` can be proposed at `cutoff`.
+    ///      This is intentional because production keepers (CryptoUpDownScheduler,
+    ///      PolymarketPoller) and Admin UI (Events.tsx proposeOutcomeBatch) rely on
+    ///      cutoff-triggered resolution. For markets where the result is known before `cutoff`,
+    ///      use `earlyResolve()` instead. For markets where resolution must wait until `endTime`,
+    ///      create with `cutoff == endTime`.
     function _proposeOutcome(uint256 marketId, uint256 outcomeIndex) internal {
         if (outcomeIndex > 1) revert InvalidOutcome(outcomeIndex);
 
         MarketRegistry.Market memory m = marketRegistry.getMarket(marketId);
+        // QGM-39 fix: frozen markets cannot enter resolved/proposed state. Fail-fast
+        // before any state mutation. Aligns with setResolved's own frozen guard.
+        if (m.frozen) revert MarketFrozen(marketId);
         require(
             (m.tradingCutoff > 0 && block.timestamp >= m.tradingCutoff) || block.timestamp >= m.endTime,
             "Market not yet ended or cutoff not reached"
@@ -242,6 +254,11 @@ contract CentralizedOracleRouter is
     function _earlyResolve(uint256 marketId, uint256 outcomeIndex) internal {
         if (outcomeIndex > 1) revert InvalidOutcome(outcomeIndex);
 
+        // QGM-39 fix: frozen markets cannot be early-resolved either. Council must
+        // unfreeze first before any proposal flow can progress.
+        MarketRegistry.Market memory m = marketRegistry.getMarket(marketId);
+        if (m.frozen) revert MarketFrozen(marketId);
+
         Proposal storage p = _proposals[marketId];
         if (p.status == ProposalStatus.PROPOSED || p.status == ProposalStatus.DISPUTED || p.status == ProposalStatus.FINALIZED) {
             revert ProposalAlreadyExists(marketId);
@@ -328,8 +345,19 @@ contract CentralizedOracleRouter is
 
     /// @notice Council rejects the proposal entirely. Market returns to unresolved.
     /// @dev Allows a new proposal to be submitted. Bond is returned to disputer.
+    ///      QGM-10 fix: automatically resets tradingCutoff so the market can resume trading
+    ///      after rejection. If endTime is still 1+ hour ahead, cutoff is reset to
+    ///      (endTime - 1h). If endTime is imminent or past, cutoff reset is skipped
+    ///      (legacy no-reset behavior, since the market is past its trading window anyway).
+    ///      Use `emergencyRejectAndResetCutoff` if council needs to set a specific cutoff.
     function emergencyReject(uint256 marketId) external onlyRole(Roles.COUNCIL_ROLE) nonReentrant {
-        _emergencyReject(marketId, 0, false);
+        MarketRegistry.Market memory m = marketRegistry.getMarket(marketId);
+        if (m.endTime > block.timestamp + 1 hours) {
+            uint256 newCutoff = m.endTime - 1 hours;
+            _emergencyReject(marketId, newCutoff, true);
+        } else {
+            _emergencyReject(marketId, 0, false);
+        }
     }
 
     /// @notice Council rejects the proposal and resets tradingCutoff so the market can resume trading.
