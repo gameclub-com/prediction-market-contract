@@ -443,14 +443,25 @@ contract CentralizedOracleRouter is
         p.status = ProposalStatus.FINALIZED;
         p.outcomeIndex = outcomeIndex;
 
-        // Set resolved if not already
+        // QGM-47 fix: unfreeze BEFORE setResolved. The QGM-39 guard makes setResolved()
+        // reject frozen markets, but a market can be validly `frozen && unresolved` (e.g.
+        // disputed, or council-frozen during an emergency). The old order called setResolved
+        // first and reverted for that state, breaking the Safety Council emergency path and
+        // reverting whole emergencyResolveBatch calls. Unfreezing first lets the council
+        // resolve such markets while preserving the registry invariant (setResolved still
+        // never runs against a frozen market). This is the intended emergency override and
+        // does NOT reintroduce the QGM-39 stuck `frozen && resolved` state — by the time
+        // setResolved runs the market is already unfrozen.
         MarketRegistry.Market memory m = marketRegistry.getMarket(marketId);
+        if (m.frozen) {
+            try marketRegistry.unfreezeMarket(marketId) {} catch {}
+            m = marketRegistry.getMarket(marketId); // refresh frozen/resolved flags
+        }
+
+        // Set resolved if not already
         if (!m.resolved) {
             marketRegistry.setResolved(marketId);
         }
-
-        // Unfreeze if frozen
-        try marketRegistry.unfreezeMarket(marketId) {} catch {}
 
         // Finalize
         marketRegistry.finalizeResolution(marketId, outcomeIndex);

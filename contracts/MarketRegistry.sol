@@ -30,6 +30,10 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     error MarketNotYetResolved(uint256 marketId);
     error OIUnderflowErr(uint256 marketId, uint256 currentOI, uint256 requestedOI);
     error CollateralPerSetImmutable(uint256 marketId);
+    // QGM-45 fix: block OI mutation while the market is registry-resolved but the CT-side
+    // condition has not yet received payouts (the open dispute window). Keeps split/merge
+    // OI accounting symmetric so mint and merge cannot diverge during that desync window.
+    error OIChangeWhileResolving(uint256 marketId);
     // Option C: ConditionalTokens link + protocol-wide OI sync
     error NotConditionalTokens();
     error MaxOIExceeded(uint256 marketId, uint256 currentOI, uint256 attempted, uint256 max);
@@ -570,6 +574,10 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         Market storage m = markets[marketId];
         // M-5 v2: Validate market exists
         if (!m.exists) revert MarketNotFound(marketId);
+        // QGM-45 fix: unify the resolved gate across ALL OI mutators (not just the CT
+        // split/merge hooks). This RELAYER path must not mutate OI once the market is
+        // resolved, so the dispute-window invariant cannot be sidestepped through it.
+        if (m.resolved) revert OIChangeWhileResolving(marketId);
         m.totalVolume += volume;
         m.currentOI += oi;
     }
@@ -592,6 +600,8 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         Market storage m = markets[marketId];
         // M-5 v2: Validate market exists
         if (!m.exists) revert MarketNotFound(marketId);
+        // QGM-45 fix: mirror addVolumeAndOI / the CT hooks — no OI mutation while resolved.
+        if (m.resolved) revert OIChangeWhileResolving(marketId);
         if (oi > m.currentOI) revert OIUnderflowErr(marketId, m.currentOI, oi);
         m.currentOI -= oi;
     }
@@ -619,6 +629,15 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     ///         QGM-40 fix: updates BOTH `conditionalTokens` (lifecycle reference) and
     ///         `conditionalTokensAddress` (OI hook authorization) atomically to prevent
     ///         split-brain operation.
+    ///         QGM-48 HARD OPERATIONAL INVARIANT: CT reset/rotation is an EMERGENCY /
+    ///         deployment-time recovery tool ONLY — live migration is NOT supported.
+    ///         A market does not store the CT instance it was created under, so lifecycle
+    ///         calls (finalizeResolution / finalizeResolutionInvalid / expireMarket) always
+    ///         route reportPayouts to the CURRENT global `conditionalTokens` pointer.
+    ///         Therefore this function and emergencyResetConditionalTokens() MUST NOT be
+    ///         used while any market created under the old CT is still unresolved or has
+    ///         live positions: all such markets must be fully settled first. Pointing the
+    ///         registry at a new CT only affects NEWLY created markets.
     function setConditionalTokens(address _ct) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (conditionalTokensAddress != address(0)) revert ConditionalTokensAlreadySet();
         require(_ct != address(0), "Zero CT");
@@ -633,6 +652,18 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
     ///         QGM-40 fix: clears BOTH references atomically; lifecycle functions
     ///         (`finalizeResolution`, `finalizeResolutionInvalid`, `expireMarket`)
     ///         will revert with `ConditionalTokensNotSet` until re-wired.
+    ///         QGM-48 HARD OPERATIONAL INVARIANT: see setConditionalTokens(). Only call this
+    ///         when every market on the old CT is fully settled; old-CT positions left
+    ///         unresolved cannot be finalized against a different CT instance afterwards.
+    ///         DESIGN NOTE (QGM-48): this reset is deliberately left UNCONDITIONAL — it is
+    ///         the protocol's emergency kill-switch. Once `conditionalTokensAddress` is zero,
+    ///         the `onlyConditionalTokens` gate stops authorizing the old CT, so its
+    ///         splitPosition()/mergePositions() OI hooks revert and new protocol minting halts.
+    ///         An on-chain "no unresolved markets" guard was intentionally NOT added: it would
+    ///         block exactly the incident (a compromised/buggy CT with live markets) in which
+    ///         this kill-switch must work. The invariant is therefore enforced operationally
+    ///         (admin-gated + documented), and the failure mode is loud and recoverable
+    ///         (`ConditionalTokensNotSet`) rather than a silent mis-route.
     function emergencyResetConditionalTokens() external onlyRole(DEFAULT_ADMIN_ROLE) {
         address prev = conditionalTokensAddress;
         conditionalTokensAddress = address(0);
@@ -684,7 +715,14 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         if (marketId == 0) return; // condition not registered as a protocol market
         Market storage m = markets[marketId];
         if (!m.exists) return;
-        if (m.resolved) return; // post-resolution mints (QGM-04 guarded elsewhere)
+        // QGM-45 fix: previously this silently skipped (`return`) when m.resolved, which let
+        // splitPosition mint OI-skipped sets during the registry-resolved / CT-unresolved
+        // dispute window while mergePositions still decremented OI — an asymmetric drain.
+        // Reverting blocks splitPosition entirely in that window so mint/merge stay symmetric.
+        // Reachable ONLY in the dispute window: post-finalize splits are already rejected by
+        // ConditionalTokens' own `isResolved` guard (QGM-04) before this hook is called, and
+        // the no-dispute path sets resolved+finalized atomically (no observable window).
+        if (m.resolved) revert OIChangeWhileResolving(marketId);
 
         uint256 newOI = m.currentOI + oi;
         if (m.maxOpenInterest > 0 && newOI > m.maxOpenInterest) {
@@ -702,6 +740,12 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         if (marketId == 0) return;
         Market storage m = markets[marketId];
         if (!m.exists) return;
+        // QGM-45 fix: mirror addOIByCondition's gate. During the registry-resolved /
+        // CT-unresolved dispute window, mergePositions still calls this hook (its own
+        // `!isResolved` skip from QGM-43 only fires once the CT condition is resolved).
+        // Reverting here keeps OI frozen symmetrically with the blocked mint side, so an
+        // attacker cannot mint-then-merge to underreport currentOI or reopen maxOI capacity.
+        if (m.resolved) revert OIChangeWhileResolving(marketId);
 
         if (oi > m.currentOI) revert OIUnderflowErr(marketId, m.currentOI, oi);
         m.currentOI -= oi;

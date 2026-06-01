@@ -88,6 +88,7 @@ contract ExchangeCLOB is
         uint256 surplus;    // accumulated MINT surplus for single treasury transfer
     }
 
+
     /// @dev V3: Aggregated MINT sweep — multiple MINT fills with the same taker + market
     /// settled via a single splitPosition call. Gas savings: ~58% for 5-fill sweeps.
     struct MintSweep {
@@ -744,47 +745,48 @@ contract ExchangeCLOB is
     }
 
     /// @dev COMPLEMENTARY settlement: P2P transferFrom (Polymarket-style).
-    /// @dev QGM-30 fix: ERC1155 share transfer happens FIRST inside a try/catch.
-    ///      If the buyer's onERC1155Received reverts (despite passing the upfront
-    ///      `_canReceiveERC1155` interface check), this function returns the soft-fail
-    ///      reason "rcr" so the surrounding batch survives. Returning a non-empty string
-    ///      from this function means the caller (`_executeComplementary`) must propagate
-    ///      it; therefore the signature is changed from void to `string memory`.
+    /// @dev COMPLEMENTARY settlement: P2P with the buyer's USDT escrowed first.
+    ///      QGM-46 fix: escrow the buyer's USDT into this contract BEFORE delivering the
+    ///      ERC1155 shares. The QGM-30 fix had moved the ERC1155 transfer first (so a receiver
+    ///      rejection could be caught and turned into a "rcr" skip), but the buyer's USDT pull
+    ///      stayed AFTER the transfer and OUTSIDE the try/catch. A buyer could therefore accept
+    ///      the ERC1155 token and revoke/move its USDT inside onERC1155Received(), making the
+    ///      later pull revert and abort the WHOLE batch — a TOCTOU against the upfront
+    ///      balance/allowance checks. Pulling buyerTotal into escrow first removes that "later
+    ///      pull": payment is already secured before the buyer ever gains control. If the
+    ///      ERC1155 delivery (or its receiver hook) then reverts, the escrow is refunded and
+    ///      only this fill is skipped, so QGM-30 stays resolved and QGM-46 is closed without
+    ///      any new external surface.
     function _applyComplementary(
         Fill calldata fill, FillCtx memory ctx,
         uint256 posId, uint256 shareAmount, BatchAcc memory acc
     ) internal returns (string memory) {
-        // ── 1. ERC1155 shares FIRST: seller → buyer (try/catch for QGM-30) ──
-        // No state changes happen before this point in the apply phase, so a revert here
-        // leaves all books untouched and a "rcr" skip is safe.
+        // ── 1. Escrow buyer's full payment FIRST (standard USDT invokes no callback) ──
+        // buyerTotal == fillValue + fee (QGM-12: buyer pays both; seller gets full fillValue).
+        uint256 buyerTotal = _checkedAdd(ctx.fillValue, fill.fee);
+        if (buyerTotal > 0) {
+            usdt.safeTransferFrom(ctx.buyer, address(this), buyerTotal);
+        }
+
+        // ── 2. ERC1155 shares: seller → buyer. The buyer's receiver hook runs here. ──
         try conditionalTokens.safeTransferFrom(ctx.seller, ctx.buyer, posId, shareAmount, "") {}
         catch {
+            // Delivery (or the receiver hook) failed — refund the escrow and skip just this
+            // fill so the surrounding settleBatch / forceSettleBatch survives (QGM-30 + QGM-46).
+            if (buyerTotal > 0) usdt.safeTransfer(ctx.buyer, buyerTotal);
             return "rcr";
         }
 
-        // ── 2. Filled tracking (M-1: by orderHash) ──
-        filled[ctx.makerHash] += fill.fillAmount;
+        // ── 3. Settlement committed. Book-keeping + pay the seller out of escrow. ──
+        filled[ctx.makerHash] += fill.fillAmount;   // M-1: by orderHash
         filled[ctx.takerHash] += fill.fillAmount;
-
-        // ── 3. M-4: COMPLEMENTARY = volume only, no OI change ──
-        marketRegistry.addVolume(ctx.marketId, ctx.fillValue);
-
-        // ── 4. Dust Kill (M-1: by orderHash) ──
+        marketRegistry.addVolume(ctx.marketId, ctx.fillValue); // M-4: COMPLEMENTARY = volume only
         _dustKill(ctx.makerHash, fill.makerOrder.amount);
         _dustKill(ctx.takerHash, fill.takerOrder.amount);
 
-        // ── 5. USDT: buyer → seller (full fillValue), fee paid separately by buyer ──
-        // QGM-12: buyer pays fillValue + fee separately. Seller receives full fillValue.
-        // Balance/allowance was pre-checked in _executeComplementary; standard USDT
-        // transfers do not invoke arbitrary callbacks, so these are reliable post-CT.
-        uint256 sellerProceeds = ctx.fillValue;
-        if (fill.fee > 0) {
-            usdt.safeTransferFrom(ctx.buyer, address(this), fill.fee);
-            acc.fees = _checkedAdd(acc.fees, fill.fee);
-        }
-        if (sellerProceeds > 0) {
-            usdt.safeTransferFrom(ctx.buyer, ctx.seller, sellerProceeds);
-        }
+        // QGM-12: seller receives full fillValue; fee retained as protocol fee (acc → _collectFee).
+        if (fill.fee > 0) acc.fees = _checkedAdd(acc.fees, fill.fee);
+        if (ctx.fillValue > 0) usdt.safeTransfer(ctx.seller, ctx.fillValue);
 
         // L-7: matchType in event
         emit FillExecuted(
