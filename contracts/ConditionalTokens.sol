@@ -151,7 +151,13 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
     ///         reinitializer(2) 보장 — 한 번만 실행 가능.
     ///         기존 admin(=deployer)이 upgradeToAndCall()로 호출.
     /// @param _newAdmin AccessControl의 DEFAULT_ADMIN_ROLE을 받을 주소 (Timelock/Multisig)
+    /// @dev QGM-51 fix: `reinitializer` only guarantees once-per-version, not WHO may call it.
+    ///      AccessControl is not yet active here, so we authenticate against the V1 upgrade
+    ///      authority (`admin`, set in initialize()/V1). This blocks an attacker from
+    ///      front-running the migration and granting themselves DEFAULT_ADMIN_ROLE if the
+    ///      upgrade and this call are not executed atomically via upgradeToAndCall.
     function migrateToAccessControl(address _newAdmin) external reinitializer(2) {
+        require(msg.sender == admin, "Not admin");
         require(_newAdmin != address(0), "Zero admin");
         __AccessControl_init();
         _grantRole(DEFAULT_ADMIN_ROLE, _newAdmin);
@@ -163,7 +169,11 @@ contract ConditionalTokens is Initializable, ERC1155Upgradeable, AccessControlUp
     /// @dev    reinitializer(3) — one-time only. Called after upgrading to V3 implementation.
     ///         Registry must be set BEFORE splitPosition / mergePositions are called for OI tracking.
     ///         If skipped, OI sync is silently disabled (back-compat).
-    function initializeVx(address _marketRegistry) external reinitializer(3) {
+    /// @dev    QGM-51 fix: gated on DEFAULT_ADMIN_ROLE. By the time reinitializer(3) runs,
+    ///         AccessControl is always active (set in initialize() or migrateToAccessControl()),
+    ///         so this prevents an attacker from front-running the V3 wiring to consume the
+    ///         reinitializer slot and point `marketRegistry` at a malicious/inert address.
+    function initializeVx(address _marketRegistry) external reinitializer(3) onlyRole(DEFAULT_ADMIN_ROLE) {
         require(_marketRegistry != address(0), "Zero registry");
         marketRegistry = IMarketRegistryOIHook(_marketRegistry);
         emit MarketRegistrySet(_marketRegistry);

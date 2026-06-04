@@ -606,6 +606,18 @@ contract ExchangeCLOB is
     // M-1: Takes precomputed hash to avoid double computation
     // H-3: Added sanctioned check
     // skipDeadline=true: force-settle path (allows expired orders for recovery)
+    //
+    // QGM-53 (operational invariant): the on-chain sanctions check screens `order.maker`
+    // directly. When the maker is an official ProxyWallet, the sanctioned EOA *behind* the
+    // proxy is NOT resolved here — doing so on-chain would require a factory reference
+    // (a storage-layout change interacting with QGM-24) plus an external owner() lookup in
+    // this view hot path (revert/gas surface), which is not warranted for a relayer-gated,
+    // non-permissionless path. SafeProxyFactory applies a BEST-EFFORT EOA-owner check
+    // (owner.code.length == 0, bypassable mid-construction / for precomputed CREATE2 owners),
+    // so on-chain EOA-ownership is NOT guaranteed. The authoritative control is therefore
+    // operational: the RELAYER (settleBatch is RELAYER_ROLE-gated) MUST screen the beneficial
+    // owner of proxy makers off-chain before settlement. Documented requirement, not an
+    // on-chain guarantee.
     function _validateOrder(
         Order calldata order, bytes calldata sig, bool isMaker, bytes32 h, bool skipDeadline
     ) internal view returns (string memory) {
@@ -757,6 +769,19 @@ contract ExchangeCLOB is
     ///      ERC1155 delivery (or its receiver hook) then reverts, the escrow is refunded and
     ///      only this fill is skipped, so QGM-30 stays resolved and QGM-46 is closed without
     ///      any new external surface.
+    ///
+    ///      QGM-54 (intended design): the "rcr" skip means a CONTRACT buyer can soft-cancel
+    ///      a matched complementary fill by rejecting the ERC1155 receipt in its
+    ///      onERC1155Received() hook, and — because the full buyerTotal (fillValue + fee) is
+    ///      refunded before acc.fees is incremented — it is not charged the trade fee on that
+    ///      path. This is accepted on purpose: per-fill soft-fail is what keeps settleBatch /
+    ///      forceSettleBatch live (QGM-30/QGM-46) instead of letting one bad receiver abort
+    ///      the whole batch, and the only state touched on the skip (the escrow pull) is fully
+    ///      refunded (net-zero, no partial state). It is NOT permissionlessly exploitable:
+    ///      settleBatch is RELAYER_ROLE-gated. Operational invariant: the off-chain orderbook
+    ///      MUST screen untrusted ERC1155-receiver / EIP-1271 contract-wallet buyers (and may
+    ///      bump userNonce to drop a maker that repeatedly soft-cancels) — fee-charging on a
+    ///      rejected delivery is intentionally NOT enforced on-chain.
     function _applyComplementary(
         Fill calldata fill, FillCtx memory ctx,
         uint256 posId, uint256 shareAmount, BatchAcc memory acc
@@ -888,13 +913,22 @@ contract ExchangeCLOB is
         }
     }
 
+    /// @dev QGM-52 fix: strictly canonical and NEVER-reverting receiver probe.
+    ///      Requires (1) staticcall success and (2) an EXACT 32-byte payload, then accepts
+    ///      only the canonical boolean `true` (the word == 1). It decodes as `uint256`
+    ///      rather than `bool` on purpose: `abi.decode(_, (bool))` raises Panic(0x21) on a
+    ///      non-canonical bool payload (e.g. a returned `2`), which — in the complementary
+    ///      path that treats this as a soft "bri" skip — would otherwise revert the whole
+    ///      settleBatch instead of skipping the single fill. Any deviation (revert,
+    ///      short/long payload, non-canonical bool) yields `false` without reverting.
     function _canReceiveERC1155(address account) internal view returns (bool) {
         if (account.code.length == 0) return true;
 
         (bool success, bytes memory result) = account.staticcall(
             abi.encodeWithSelector(IERC165.supportsInterface.selector, type(IERC1155Receiver).interfaceId)
         );
-        return success && result.length >= 32 && abi.decode(result, (bool));
+        if (!success || result.length != 32) return false;
+        return abi.decode(result, (uint256)) == 1;
     }
 
     function _requireERC1155Receiver(address account) internal view {

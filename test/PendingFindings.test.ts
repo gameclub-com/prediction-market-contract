@@ -439,3 +439,107 @@ describe("QGM-46 — complementary settlement payment TOCTOU", function () {
     expect((await ct.balanceOf(alice.address, posId0)) - aliceSharesBefore).to.equal(AMOUNT);
   });
 });
+
+// ===========================================================================
+// QGM-51 — unauthenticated reinitializers can be front-run
+// ===========================================================================
+describe("QGM-51 — reinitializer authorization", function () {
+  async function freshCT() {
+    const [deployer, , , , , treasury, , alice] = await ethers.getSigners();
+    const MockUSDT = await ethers.getContractFactory("MockUSDT");
+    const usdt = await MockUSDT.deploy();
+    const CT = await ethers.getContractFactory("ConditionalTokens");
+    const ct = await upgrades.deployProxy(CT, [await usdt.getAddress(), treasury.address, deployer.address], {
+      kind: "uups", initializer: "initialize",
+    });
+    return { ct, deployer, alice };
+  }
+
+  it("initializeVx rejects a non-admin caller, then succeeds for the admin", async function () {
+    const { ct, deployer, alice } = await freshCT();
+
+    // A front-runner without DEFAULT_ADMIN_ROLE cannot consume reinitializer(3).
+    await expect(ct.connect(alice).initializeVx(alice.address))
+      .to.be.revertedWithCustomError(ct, "AccessControlUnauthorizedAccount");
+
+    // The reverted attempt did not consume the slot — the admin can still wire it.
+    await expect(ct.connect(deployer).initializeVx(deployer.address))
+      .to.emit(ct, "MarketRegistrySet");
+  });
+
+  it("migrateToAccessControl rejects a non-admin caller", async function () {
+    const { ct, alice } = await freshCT();
+    await expect(ct.connect(alice).migrateToAccessControl(alice.address))
+      .to.be.revertedWith("Not admin");
+  });
+});
+
+// ===========================================================================
+// QGM-52 — non-canonical ERC-165 receiver probe must not revert the batch
+// ===========================================================================
+describe("QGM-52 — non-canonical ERC-165 receiver probe", function () {
+  const PRICE = ethers.parseEther("0.60");
+  const AMOUNT = ethers.parseEther("100");
+
+  it("a buyer with a non-canonical supportsInterface() soft-fails ('bri'), not a batch revert", async function () {
+    const { relayer, bob, exchange, ct, posId0, exchangeAddr } = await loadFixture(pendingFixture);
+
+    const Mock = await ethers.getContractFactory("MockNonCanonicalReceiver");
+    const weird = await Mock.deploy();
+    const buyerAddr = await weird.getAddress();
+
+    const deadline = BigInt((await time.latest()) + 86400);
+    const makerOrder = makeOrder({ maker: buyerAddr, side: 0, price: PRICE, amount: AMOUNT, nonce: 1, deadline, salt: 1 });
+    const takerOrder = makeOrder({ maker: bob.address, side: 1, price: PRICE, amount: AMOUNT, nonce: 1, deadline, salt: 1001 });
+    const fill = {
+      makerOrder, takerOrder,
+      makerSig: "0x", // contract buyer accepts via EIP-1271
+      takerSig: await signOrder(bob, takerOrder, exchangeAddr),
+      fillAmount: AMOUNT, fee: 0n, matchType: 0,
+    };
+
+    const bobSharesBefore = await ct.balanceOf(bob.address, posId0);
+
+    // Pre-fix: abi.decode(_, (bool)) on the word `2` panicked → the whole settleBatch reverted.
+    // Post-fix: the probe returns false → only this fill is skipped ("bri"); the batch settles.
+    await expect(exchange.connect(relayer).settleBatch(1, [fill]))
+      .to.emit(exchange, "BatchSettled")
+      .withArgs(1, 0, 1, relayer.address); // 0 success, 1 skip
+
+    expect(await ct.balanceOf(buyerAddr, posId0)).to.equal(0n);
+    expect(await ct.balanceOf(bob.address, posId0)).to.equal(bobSharesBefore);
+  });
+
+  it("a non-canonical receiver does not abort a good fill in the same batch", async function () {
+    const { relayer, alice, bob, exchange, ct, posId0, exchangeAddr } = await loadFixture(pendingFixture);
+
+    const Mock = await ethers.getContractFactory("MockNonCanonicalReceiver");
+    const weird = await Mock.deploy();
+    const buyerAddr = await weird.getAddress();
+
+    const deadline = BigInt((await time.latest()) + 86400);
+
+    const badMaker = makeOrder({ maker: buyerAddr, side: 0, price: PRICE, amount: AMOUNT, nonce: 1, deadline, salt: 1 });
+    const badTaker = makeOrder({ maker: bob.address, side: 1, price: PRICE, amount: AMOUNT, nonce: 1, deadline, salt: 1001 });
+    const badFill = {
+      makerOrder: badMaker, takerOrder: badTaker,
+      makerSig: "0x", takerSig: await signOrder(bob, badTaker, exchangeAddr),
+      fillAmount: AMOUNT, fee: 0n, matchType: 0,
+    };
+
+    const goodMaker = makeOrder({ maker: alice.address, side: 0, price: PRICE, amount: AMOUNT, nonce: 2, deadline, salt: 2 });
+    const goodTaker = makeOrder({ maker: bob.address, side: 1, price: PRICE, amount: AMOUNT, nonce: 2, deadline, salt: 2002 });
+    const goodFill = {
+      makerOrder: goodMaker, takerOrder: goodTaker,
+      makerSig: await signOrder(alice, goodMaker, exchangeAddr),
+      takerSig: await signOrder(bob, goodTaker, exchangeAddr),
+      fillAmount: AMOUNT, fee: 0n, matchType: 0,
+    };
+
+    const aliceBefore = await ct.balanceOf(alice.address, posId0);
+    await expect(exchange.connect(relayer).settleBatch(1, [badFill, goodFill]))
+      .to.emit(exchange, "BatchSettled")
+      .withArgs(1, 1, 1, relayer.address); // good settles, bad skipped
+    expect((await ct.balanceOf(alice.address, posId0)) - aliceBefore).to.equal(AMOUNT);
+  });
+});

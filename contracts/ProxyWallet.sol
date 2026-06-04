@@ -46,7 +46,6 @@ contract ProxyWallet is IERC1271, ERC1155Holder {
     // ─── Events ───
     event Executed(address indexed target, uint256 value, bytes data);
     event ExecutionFailed(uint256 indexed nonce, address indexed target, uint256 value, bytes data, bytes returnData);
-    event BatchExecutionFailed(uint256 indexed nonce, uint256 indexed index, address indexed target, uint256 value, bytes data, bytes returnData);
 
     // L-5 v2: Lock implementation contract (prevent initialization of the template)
     constructor() {
@@ -150,6 +149,11 @@ contract ProxyWallet is IERC1271, ERC1155Holder {
 
     // ─── Meta-transaction: executeBatchOnBehalf ───
     /// @notice Batch version of executeOnBehalf.
+    /// @dev QGM-49 fix: execution is ATOMIC — a failed subcall reverts the whole
+    ///      transaction (matching `executeBatch()`), so earlier subcalls are rolled
+    ///      back and the signed `nonce` is NOT consumed. This removes the previous
+    ///      partial-execution semantics where a relayer could commit the early
+    ///      subcalls of an owner-signed batch while permanently burning the nonce.
     /// @param targets  Array of addresses to call
     /// @param values   Array of ETH values
     /// @param datas    Array of calldata payloads
@@ -173,10 +177,7 @@ contract ProxyWallet is IERC1271, ERC1155Holder {
         results = new bytes[](targets.length);
         for (uint256 i = 0; i < targets.length;) {
             (bool ok, bytes memory res) = targets[i].call{value: values[i]}(datas[i]);
-            if (!ok) {
-                emit BatchExecutionFailed(nonce, i, targets[i], values[i], datas[i], res);
-                return results;
-            }
+            if (!ok) revert CallFailed(res);
             results[i] = res;
             unchecked { i++; }
         }

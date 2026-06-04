@@ -467,7 +467,7 @@ describe("ProxyWallet", function () {
       ).to.be.revertedWithCustomError(proxy, "InvalidSignature");
     });
 
-    it("failed batch execution consumes nonce and emits failure event", async function () {
+    it("QGM-49: failed batch execution reverts atomically and does NOT consume the nonce", async function () {
       const { factory, user, relayer, usdt } = await loadFixture(proxyFixture);
 
       await factory.createProxy(user.address, ethers.ZeroHash);
@@ -475,6 +475,8 @@ describe("ProxyWallet", function () {
       const PW = await ethers.getContractFactory("ProxyWallet");
       const proxy = PW.attach(proxyAddr) as any;
 
+      // Proxy holds 0 USDT, so the transfer subcall fails. Pre-fix this would commit
+      // earlier subcalls and burn the nonce; QGM-49 makes the whole call revert atomically.
       const targets = [await usdt.getAddress()];
       const values = [0n];
       const datas = [
@@ -507,14 +509,71 @@ describe("ProxyWallet", function () {
         targetsHash, valuesHash, datasHash, nonce, deadline,
       });
 
+      // Reverts atomically (matches executeBatch behavior).
       await expect(
         proxy.connect(relayer).executeBatchOnBehalf(targets, values, datas, nonce, deadline, sig)
-      ).to.emit(proxy, "BatchExecutionFailed");
+      ).to.be.revertedWithCustomError(proxy, "CallFailed");
 
-      expect(await proxy.usedNonces(nonce)).to.equal(true);
+      // Nonce was rolled back with the revert, so it is still unused and the batch is retryable.
+      expect(await proxy.usedNonces(nonce)).to.equal(false);
       await expect(
         proxy.connect(relayer).executeBatchOnBehalf(targets, values, datas, nonce, deadline, sig)
-      ).to.be.revertedWithCustomError(proxy, "NonceAlreadyUsed");
+      ).to.be.revertedWithCustomError(proxy, "CallFailed");
+    });
+
+    it("QGM-49: a partial-success batch reverts and rolls back the early subcall", async function () {
+      const { factory, user, relayer, usdt } = await loadFixture(proxyFixture);
+
+      await factory.createProxy(user.address, ethers.ZeroHash);
+      const proxyAddr = await factory.proxyOf(user.address);
+      const PW = await ethers.getContractFactory("ProxyWallet");
+      const proxy = PW.attach(proxyAddr) as any;
+
+      // Fund only 5 USDT. Subcall[0] transfers 5 (would succeed), subcall[1] transfers 5
+      // more (fails — insufficient balance). The whole batch must revert, leaving balance intact.
+      await usdt.mint(proxyAddr, ethers.parseEther("5"));
+      const usdtAddr = await usdt.getAddress();
+      const transfer5 = usdt.interface.encodeFunctionData("transfer", [user.address, ethers.parseEther("5")]);
+      const targets = [usdtAddr, usdtAddr];
+      const values = [0n, 0n];
+      const datas = [transfer5, transfer5];
+      const nonce = 778n;
+      const deadline = 0n;
+
+      const network = await ethers.provider.getNetwork();
+      const domain = {
+        name: "GameClub ProxyWallet",
+        version: "1",
+        chainId: network.chainId,
+        verifyingContract: proxyAddr,
+      };
+      const batchTypes = {
+        ExecuteBatch: [
+          { name: "targetsHash", type: "bytes32" },
+          { name: "valuesHash", type: "bytes32" },
+          { name: "datasHash", type: "bytes32" },
+          { name: "nonce", type: "uint256" },
+          { name: "deadline", type: "uint256" },
+        ],
+      };
+      const targetsHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["address", "address"], targets));
+      const valuesHash = ethers.keccak256(ethers.solidityPacked(["uint256", "uint256"], values));
+      const datasHash = ethers.keccak256(ethers.solidityPacked(
+        ["bytes32", "bytes32"],
+        [ethers.keccak256(transfer5), ethers.keccak256(transfer5)],
+      ));
+
+      const sig = await user.signTypedData(domain, batchTypes, {
+        targetsHash, valuesHash, datasHash, nonce, deadline,
+      });
+
+      await expect(
+        proxy.connect(relayer).executeBatchOnBehalf(targets, values, datas, nonce, deadline, sig)
+      ).to.be.revertedWithCustomError(proxy, "CallFailed");
+
+      // The first transfer was rolled back — proxy keeps its full balance, user got nothing.
+      expect(await usdt.balanceOf(proxyAddr)).to.equal(ethers.parseEther("5"));
+      expect(await proxy.usedNonces(nonce)).to.equal(false);
     });
   });
 
@@ -671,6 +730,34 @@ describe("SafeProxyFactory", function () {
       const proxy2 = await factory.proxyOf(otherUser.address);
 
       expect(proxy1).to.not.equal(proxy2);
+    });
+
+    it("QGM-50: salt is canonical — any salt predicts the same deployable address", async function () {
+      const { factory, user } = await loadFixture(proxyFixture);
+
+      const saltA = ethers.ZeroHash;
+      const saltB = ethers.id("some-other-salt");
+
+      const predA = await factory.getProxyAddress(user.address, saltA);
+      const predB = await factory.getProxyAddress(user.address, saltB);
+      expect(predA).to.equal(predB); // salt does not change the address
+
+      // Create with a DIFFERENT salt than was used to predict — it still deploys at predA,
+      // so funds sent to a predicted address can never become undeployable.
+      await factory.createProxy(user.address, saltB);
+      expect(await factory.proxyOf(user.address)).to.equal(predA);
+
+      // After creation, prediction reflects the actually-deployed address for any salt.
+      expect(await factory.getProxyAddress(user.address, saltA)).to.equal(predA);
+    });
+
+    it("QGM-53: createProxy rejects a contract (non-EOA) owner", async function () {
+      const { factory, usdt } = await loadFixture(proxyFixture);
+
+      // `usdt` is a deployed contract — not a valid EOA owner.
+      await expect(
+        factory.createProxy(await usdt.getAddress(), ethers.ZeroHash),
+      ).to.be.revertedWithCustomError(factory, "OwnerNotEOA");
     });
   });
 
