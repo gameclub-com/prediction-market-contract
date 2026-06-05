@@ -543,3 +543,226 @@ describe("QGM-52 — non-canonical ERC-165 receiver probe", function () {
     expect((await ct.balanceOf(alice.address, posId0)) - aliceBefore).to.equal(AMOUNT);
   });
 });
+
+// ===========================================================================
+// QGM-52 (follow-up) — bounded, gas-capped receiver probe
+//   CertiK 06/04: the ERC-165 probe forwarded uncapped gas and copied unbounded
+//   return data. A hostile receiver could grief relayer gas or turn an intended
+//   per-fill validation failure into a batch-level failure. The bounded-assembly
+//   probe (gas cap + returndatasize()==32 + ≤32-byte copy) treats every oversized,
+//   out-of-gas, or malformed response as a soft "bri" skip without reverting.
+// ===========================================================================
+describe("QGM-52 follow-up — gas-capped / bounded receiver probe", function () {
+  const PRICE = ethers.parseEther("0.60");
+  const AMOUNT = ethers.parseEther("100");
+
+  async function buildContractBuyerFill(
+    buyerAddr: string, bob: HardhatEthersSigner, exchangeAddr: string,
+  ) {
+    const deadline = BigInt((await time.latest()) + 86400);
+    const makerOrder = makeOrder({ maker: buyerAddr, side: 0, price: PRICE, amount: AMOUNT, nonce: 1, deadline, salt: 1 });
+    const takerOrder = makeOrder({ maker: bob.address, side: 1, price: PRICE, amount: AMOUNT, nonce: 1, deadline, salt: 1001 });
+    return {
+      makerOrder, takerOrder,
+      makerSig: "0x", // contract buyer accepts via EIP-1271
+      takerSig: await signOrder(bob, takerOrder, exchangeAddr),
+      fillAmount: AMOUNT, fee: 0n, matchType: 0,
+    };
+  }
+
+  it("an OVERSIZED supportsInterface() payload soft-fails ('bri'), not a batch revert", async function () {
+    const { relayer, bob, exchange, usdt, ct, posId0, exchangeAddr } = await loadFixture(pendingFixture);
+    const Mock = await ethers.getContractFactory("MockGasGriefReceiver");
+    const grief = await Mock.deploy(await usdt.getAddress(), exchangeAddr);
+    await grief.setMode(1); // return 2048 bytes whose first word looks canonical
+    const buyerAddr = await grief.getAddress();
+    // Fund + approve so the fill passes the buyer balance/allowance pre-checks and the
+    // RECEIVER PROBE is the actual deciding factor for the skip.
+    await usdt.mint(buyerAddr, TEN_THOUSAND);
+    await grief.approveUsdt(TEN_THOUSAND);
+
+    const fill = await buildContractBuyerFill(buyerAddr, bob, exchangeAddr);
+    const bobBefore = await ct.balanceOf(bob.address, posId0);
+
+    // returndatasize() != 32 → probe returns false → only this fill is skipped.
+    await expect(exchange.connect(relayer).settleBatch(1, [fill]))
+      .to.emit(exchange, "BatchSettled")
+      .withArgs(1, 0, 1, relayer.address);
+    expect(await ct.balanceOf(buyerAddr, posId0)).to.equal(0n);
+    expect(await ct.balanceOf(bob.address, posId0)).to.equal(bobBefore);
+  });
+
+  it("a GAS-BOMB supportsInterface() is bounded by the cap; the batch survives and a good fill still settles", async function () {
+    const { relayer, alice, bob, exchange, usdt, ct, posId0, exchangeAddr } = await loadFixture(pendingFixture);
+    const Mock = await ethers.getContractFactory("MockGasGriefReceiver");
+    const grief = await Mock.deploy(await usdt.getAddress(), exchangeAddr);
+    await grief.setMode(2); // spin until out-of-gas inside the probe
+    const griefAddr = await grief.getAddress();
+    await usdt.mint(griefAddr, TEN_THOUSAND);
+    await grief.approveUsdt(TEN_THOUSAND);
+
+    const badFill = await buildContractBuyerFill(griefAddr, bob, exchangeAddr);
+
+    const deadline = BigInt((await time.latest()) + 86400);
+    const goodMaker = makeOrder({ maker: alice.address, side: 0, price: PRICE, amount: AMOUNT, nonce: 2, deadline, salt: 2 });
+    const goodTaker = makeOrder({ maker: bob.address, side: 1, price: PRICE, amount: AMOUNT, nonce: 2, deadline, salt: 2002 });
+    const goodFill = {
+      makerOrder: goodMaker, takerOrder: goodTaker,
+      makerSig: await signOrder(alice, goodMaker, exchangeAddr),
+      takerSig: await signOrder(bob, goodTaker, exchangeAddr),
+      fillAmount: AMOUNT, fee: 0n, matchType: 0,
+    };
+
+    const aliceBefore = await ct.balanceOf(alice.address, posId0);
+    // The capped staticcall OOGs and returns false; the bad fill is skipped, the good one settles.
+    await expect(exchange.connect(relayer).settleBatch(1, [badFill, goodFill]))
+      .to.emit(exchange, "BatchSettled")
+      .withArgs(1, 1, 1, relayer.address);
+    expect((await ct.balanceOf(alice.address, posId0)) - aliceBefore).to.equal(AMOUNT);
+  });
+
+  it("regression: a canonical contract receiver still settles normally", async function () {
+    const { relayer, bob, exchange, usdt, ct, posId0, exchangeAddr } = await loadFixture(pendingFixture);
+    const Mock = await ethers.getContractFactory("MockGasGriefReceiver");
+    const ok = await Mock.deploy(await usdt.getAddress(), exchangeAddr); // mode 0 = canonical true
+    const buyerAddr = await ok.getAddress();
+    await usdt.mint(buyerAddr, TEN_THOUSAND);
+    await ok.approveUsdt(TEN_THOUSAND);
+
+    const fill = await buildContractBuyerFill(buyerAddr, bob, exchangeAddr);
+    await expect(exchange.connect(relayer).settleBatch(1, [fill]))
+      .to.emit(exchange, "BatchSettled")
+      .withArgs(1, 1, 0, relayer.address); // 1 success, 0 skip
+    expect(await ct.balanceOf(buyerAddr, posId0)).to.equal(AMOUNT);
+  });
+});
+
+// ===========================================================================
+// QGM-45 (follow-up) — frozen-but-unresolved market must accept NO new OI
+//   CertiK 06/03: addOIByCondition checked only m.resolved, not m.frozen, so a
+//   Safety-Council-frozen (but unresolved) market could still take new direct
+//   complete-set mints up to maxOpenInterest. The OI-INCREASE writers now also
+//   gate on m.frozen; OI-DECREASE (merge/exit) stays allowed (freeze = no NEW
+//   exposure, not a full accounting pause).
+// ===========================================================================
+describe("QGM-45 follow-up — frozen-market OI gate", function () {
+  it("a frozen (but unresolved) market blocks new mints via splitPosition", async function () {
+    const { council, alice, ct, registry, conditionId } = await loadFixture(pendingFixture);
+
+    await registry.connect(council).freezeMarket(1);
+    const m = await registry.getMarket(1);
+    expect(m.frozen).to.equal(true);
+    expect(m.resolved).to.equal(false); // the frozen-but-unresolved gap CertiK flagged
+    expect(await ct.isResolved(conditionId)).to.equal(false);
+
+    await expect(
+      ct.connect(alice).splitPosition(conditionId, ethers.parseEther("100")),
+    ).to.be.revertedWithCustomError(registry, "MarketFrozen");
+  });
+
+  it("a frozen market still allows merges/exits (OI decrease) — freeze = no NEW exposure", async function () {
+    const { council, alice, ct, registry, conditionId } = await loadFixture(pendingFixture);
+
+    const oiBefore = (await registry.getMarket(1)).currentOI;
+    await registry.connect(council).freezeMarket(1);
+
+    // alice holds 5000 eligibility from the fixture; a merge (OI decrease) must remain possible
+    // and correctly decrements currentOI (the subtract hook is intentionally NOT frozen-gated).
+    await ct.connect(alice).mergePositions(conditionId, ethers.parseEther("100"));
+    expect((await registry.getMarket(1)).currentOI).to.equal(oiBefore - ethers.parseEther("100"));
+  });
+
+  it("after unfreeze, splitPosition mints again and OI tracking resumes exactly", async function () {
+    const { council, alice, ct, registry, conditionId } = await loadFixture(pendingFixture);
+
+    await registry.connect(council).freezeMarket(1);
+    await registry.connect(council).unfreezeMarket(1);
+
+    const oi0 = (await registry.getMarket(1)).currentOI;
+    await ct.connect(alice).splitPosition(conditionId, ethers.parseEther("100"));
+    expect((await registry.getMarket(1)).currentOI).to.equal(oi0 + ethers.parseEther("100"));
+  });
+
+  it("addVolumeAndOI (RELAYER OI-increase writer) is also frozen-gated", async function () {
+    const { deployer, relayer, council, registry } = await loadFixture(pendingFixture);
+    await registry.connect(deployer).grantRole(RELAYER_ROLE, relayer.address);
+
+    // Transparent while open.
+    await registry.connect(relayer).addVolumeAndOI(1, ethers.parseEther("10"), ethers.parseEther("10"));
+
+    await registry.connect(council).freezeMarket(1);
+    await expect(
+      registry.connect(relayer).addVolumeAndOI(1, ethers.parseEther("1"), ethers.parseEther("1")),
+    ).to.be.revertedWithCustomError(registry, "MarketFrozen");
+  });
+});
+
+// ===========================================================================
+// QGM-33 (follow-up) — overfill on settleBatch is a SOFT-SKIP, never a revert
+//   CertiK 06/03: the overfill accumulators used _checkedAdd(), whose overflow
+//   path reverted (ArithmeticOverflow) instead of returning a skip reason,
+//   breaking batch soft-fail for hostile inputs. The check is now a non-reverting
+//   overflow guard that yields "mof"/"tof". (The arithmetic-overflow sub-branch is
+//   unreachable with real collateral — it requires filled[] near 2**256 — so this
+//   pins the shared, observable overfill path.)
+// ===========================================================================
+describe("QGM-33 follow-up — overfill soft-skip", function () {
+  const PRICE = ethers.parseEther("0.60");
+
+  it("a fill whose fillAmount exceeds the maker order amount skips ('mof'); the batch does not revert", async function () {
+    const { relayer, alice, bob, exchange, exchangeAddr } = await loadFixture(pendingFixture);
+    const deadline = BigInt((await time.latest()) + 86400);
+
+    // maker BUY amount = 100, but the relayer submits fillAmount = 200 → overfill.
+    const makerOrder = makeOrder({ maker: alice.address, side: 0, price: PRICE, amount: ethers.parseEther("100"), nonce: 1, deadline, salt: 1 });
+    const takerOrder = makeOrder({ maker: bob.address, side: 1, price: PRICE, amount: ethers.parseEther("200"), nonce: 1, deadline, salt: 1001 });
+    const fill = {
+      makerOrder, takerOrder,
+      makerSig: await signOrder(alice, makerOrder, exchangeAddr),
+      takerSig: await signOrder(bob, takerOrder, exchangeAddr),
+      fillAmount: ethers.parseEther("200"), fee: 0n, matchType: 0,
+    };
+
+    await expect(exchange.connect(relayer).settleBatch(1, [fill]))
+      .to.emit(exchange, "BatchSettled")
+      .withArgs(1, 0, 1, relayer.address); // 0 success, 1 skip ("mof") — no revert
+  });
+
+  it("an extreme signed price + fillAmount soft-skips ('obd') instead of hard-reverting the batch", async function () {
+    // Independent-review finding: BEFORE the up-front bound check, an extreme but validly-signed
+    // price combined with a relayer-chosen fillAmount made `ctx.fillValue = Math.mulDiv(price,
+    // fillAmount, 1e18)` in _executeSettlement OVERFLOW and revert — aborting the WHOLE batch
+    // (the exact QGM-33 threat, still live for the COMPLEMENTARY/MERGE path). The bound check
+    // (price ≤ MAX_ORDER_PRICE, fillAmount ≤ MAX_ORDER_AMOUNT) turns it into a soft "obd" skip.
+    const { relayer, alice, bob, exchange, ct, posId0, exchangeAddr } = await loadFixture(pendingFixture);
+    const deadline = BigInt((await time.latest()) + 86400);
+    const AMOUNT = ethers.parseEther("100");
+
+    // GOOD fill — must still settle even though the batch also contains the malformed one.
+    const gM = makeOrder({ maker: alice.address, side: 0, price: PRICE, amount: AMOUNT, nonce: 2, deadline, salt: 2 });
+    const gT = makeOrder({ maker: bob.address, side: 1, price: PRICE, amount: AMOUNT, nonce: 2, deadline, salt: 2002 });
+    const goodFill = {
+      makerOrder: gM, takerOrder: gT,
+      makerSig: await signOrder(alice, gM, exchangeAddr),
+      takerSig: await signOrder(bob, gT, exchangeAddr),
+      fillAmount: AMOUNT, fee: 0n, matchType: 0,
+    };
+
+    // BAD fill — price 2**200 (> MAX_ORDER_PRICE), fillAmount 2**130 (> MAX_ORDER_AMOUNT):
+    // price*fillAmount/1e18 overflows uint256 ⇒ pre-fix mulDiv revert; post-fix → "obd" skip.
+    const bM = makeOrder({ maker: alice.address, side: 0, price: 2n ** 200n, amount: 2n ** 131n, nonce: 3, deadline, salt: 3 });
+    const bT = makeOrder({ maker: bob.address, side: 1, price: 1n, amount: 2n ** 131n, nonce: 3, deadline, salt: 3003 });
+    const badFill = {
+      makerOrder: bM, takerOrder: bT,
+      makerSig: await signOrder(alice, bM, exchangeAddr),
+      takerSig: await signOrder(bob, bT, exchangeAddr),
+      fillAmount: 2n ** 130n, fee: 0n, matchType: 0,
+    };
+
+    const aliceBefore = await ct.balanceOf(alice.address, posId0);
+    await expect(exchange.connect(relayer).settleBatch(1, [badFill, goodFill]))
+      .to.emit(exchange, "BatchSettled")
+      .withArgs(1, 1, 1, relayer.address); // good settles, malformed skipped — NO revert
+    expect((await ct.balanceOf(alice.address, posId0)) - aliceBefore).to.equal(AMOUNT);
+  });
+});

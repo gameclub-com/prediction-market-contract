@@ -121,11 +121,14 @@ contract ExchangeCLOB is
     /// @dev Bounded so that all downstream `price * amount`, `fee * MAX_FEE`, and accumulator
     ///      additions stay within uint256 without panic. 2^128 ≈ 3.4e38 — far above any
     ///      realistic 18-decimal trade volume.
-    uint256 public constant MAX_ORDER_AMOUNT = 2 ** 128;
+    /// @dev QGM-33: ENFORCED as a soft-skip in `_processFillInternal` (not just documentation),
+    ///      so every downstream mulDiv/_checkedAdd on the settleBatch soft-fail path is provably
+    ///      non-reverting. `internal` (no public getter) to conserve EIP-170 bytecode.
+    uint256 internal constant MAX_ORDER_AMOUNT = 2 ** 128;
     /// @dev Price is bounded by 1 collateral unit per share (cps ≤ 1e18, price ≤ cps).
-    uint256 public constant MAX_ORDER_PRICE = 1e18;
+    uint256 internal constant MAX_ORDER_PRICE = 1e18;
     /// @dev Fee is also bounded so `fee * 10_000` cannot overflow when combined with mulDiv.
-    uint256 public constant MAX_ORDER_FEE = 2 ** 128;
+    uint256 internal constant MAX_ORDER_FEE = 2 ** 128;
 
     // ─── Events ───
     event OrderCancelled(address indexed maker, bytes32 orderHash);
@@ -164,10 +167,16 @@ contract ExchangeCLOB is
     }
 
     // ─── Constants ───
-    uint256 public constant MAX_FEE = 500; // 500 bps, immutable
-    uint256 public constant MIN_ORDER = 1e18;
-    uint256 public constant MAX_FILLS_PER_BATCH = 100;
-    uint256 public constant SIG_VERIFY_GAS_LIMIT = 50_000;
+    uint256 public constant MAX_FEE = 500; // 500 bps, immutable (read by ops scripts)
+    // internal (no public getter) to conserve EIP-170 bytecode — not referenced off-chain.
+    uint256 internal constant MIN_ORDER = 1e18;
+    uint256 internal constant MAX_FILLS_PER_BATCH = 100;
+    uint256 internal constant SIG_VERIFY_GAS_LIMIT = 50_000;
+    // QGM-52 follow-up: gas cap for the ERC-165 receiver probe so a hostile receiver cannot
+    // burn relayer gas. supportsInterface is a trivial pure view (~hundreds of gas); 30k is
+    // generous headroom for any compliant receiver. `internal` (no public getter) to conserve
+    // bytecode against the EIP-170 limit — used only inside _canReceiveERC1155.
+    uint256 internal constant RECEIVER_PROBE_GAS = 30_000;
 
     bytes32 public constant ORDER_TYPEHASH = keccak256(
         "Order(address maker,uint256 marketId,uint256 outcomeIndex,uint8 side,uint256 amount,uint256 price,uint256 nonce,uint256 deadline,uint8 orderType,uint256 salt)"
@@ -471,7 +480,11 @@ contract ExchangeCLOB is
             uint256 mf = filled[mkH];
             // QGM-33 fix: use _checkedAdd for overfill comparison.
             if (mf == type(uint256).max || _checkedAdd(mf, amt) > mk.amount) revert SweepValidation(22);
-            require(mk.price + sw.takerOrder.price >= cps, "sw:price_sum");
+            // QGM-33 follow-up: replace the last raw `+` with _checkedAdd so the price-sum is a
+            // deterministic ArithmeticOverflow (acceptable on the mint-sweep hard-revert path)
+            // rather than a bare panic class. Bounded by CPS (mk.price,takerPrice <= cps <= 1e18)
+            // so it never actually overflows; this only removes the avoidable revert class.
+            require(_checkedAdd(mk.price, sw.takerOrder.price) >= cps, "sw:price_sum");
 
             uint256 col = Math.mulDiv(amt, cps, 1e18);
             if (col == 0) revert SweepValidation(23);
@@ -533,15 +546,23 @@ contract ExchangeCLOB is
 
         if (maker.marketId != taker.marketId) return "mm";
 
-        // QGM-33 fix: signed-field overflow protection is enforced by the downstream
-        // guarded primitives instead of an upfront bound check:
-        //   - `makerFilled + fillAmount`, `takerFilled + fillAmount`  → `_checkedAdd` below
-        //   - `makerOrder.price + takerOrder.price` (in `_executeMerge`) → `_checkedAdd`
-        //   - `fill.fee * 10_000`, `collateral * MAX_FEE`             → `Math.mulDiv`-based
-        //     compares in `_executeComplementary` / `_executeMerge`
-        //   - `executionPrice * fillAmount`                            → `Math.mulDiv` (no overflow)
-        // Together they convert every previously-panicking expression into a deterministic
-        // soft-fail skip reason while keeping the entry-point compact.
+        // QGM-33 (full resolution): bound the signed numeric fields UP-FRONT, before any
+        // arithmetic, and as a soft-skip ("obd") — never a revert. This is what makes every
+        // downstream product/sum on the settleBatch soft-fail path provably non-reverting:
+        //   price ≤ 1e18 and amount/fillAmount ≤ 2^128 ⇒ `price * fillAmount / 1e18` ≤ 2^128,
+        //   `makerOrder.price + takerOrder.price` ≤ 2e18, etc. — all well within uint256, so
+        //   `Math.mulDiv` (which reverts on >2^256 results) and `_checkedAdd` can no longer
+        //   abort the batch on a malformed extreme order. Without this, an extreme but validly
+        //   signed price + a relayer-chosen fillAmount could hard-revert the whole batch via the
+        //   `ctx.fillValue` mulDiv in `_executeSettlement` (the residual QGM-33 hard-revert).
+        //   Bounds are generous (2^128 ≈ 3.4e38 ≫ any real 18-decimal volume), so no legitimate
+        //   order is rejected.
+        // Only the fields that feed multiplications/sums need bounding: prices (mulDiv +
+        // priceSum) and fillAmount (every mulDiv). `amount` is used only in non-overflowing
+        // comparisons (the overfill guard is already wraparound-safe) and `fee` is capped by the
+        // downstream "fth"/"ftp" checks before it is ever accumulated, so neither needs a bound.
+        if (maker.price > MAX_ORDER_PRICE || taker.price > MAX_ORDER_PRICE
+            || fill.fillAmount > MAX_ORDER_AMOUNT) return "obd";
 
         MatchType mt = fill.matchType;
         if (mt == MatchType.COMPLEMENTARY) {
@@ -579,15 +600,23 @@ contract ExchangeCLOB is
         string memory takerErr = _validateOrder(taker, fill.takerSig, false, takerHash, force);
         if (bytes(takerErr).length > 0) return takerErr;
 
-        // QGM-33 fix: use _checkedAdd for overfill accounting so an overflow becomes the
-        // soft-fail "mof"/"tof" path (set to type(uint256).max-style sentinel above already
-        // handles the explicit kill marker; the new check guards arithmetic overflow).
+        // QGM-33 follow-up: overfill accounting must stay a SOFT-FAIL on settleBatch even for
+        // hostile inputs. A non-reverting overflow guard (`nf < base` detects wraparound) yields
+        // the "mof"/"tof" skip reason instead of an ArithmeticOverflow revert, so one malformed
+        // fill can never abort the whole batch. Non-overflow behavior is identical to the prior
+        // `_checkedAdd(...) > amount` compare.
         uint256 makerFilled = filled[makerHash];
         if (makerFilled == type(uint256).max) return "mof";
-        if (_checkedAdd(makerFilled, fill.fillAmount) > maker.amount) return "mof";
+        unchecked {
+            uint256 nf = makerFilled + fill.fillAmount;
+            if (nf < makerFilled || nf > maker.amount) return "mof";
+        }
         uint256 takerFilled = filled[takerHash];
         if (takerFilled == type(uint256).max) return "tof";
-        if (_checkedAdd(takerFilled, fill.fillAmount) > taker.amount) return "tof";
+        unchecked {
+            uint256 nf = takerFilled + fill.fillAmount;
+            if (nf < takerFilled || nf > taker.amount) return "tof";
+        }
 
         return _executeSettlement(fill, makerHash, takerHash, acc);
     }
@@ -642,7 +671,9 @@ contract ExchangeCLOB is
         FillCtx memory ctx;
         ctx.marketId = fill.makerOrder.marketId;
         ctx.executionPrice = fill.makerOrder.price; // Maker price (Surplus Matching)
-        // QGM-33: inputs are bounded (MAX_ORDER_PRICE × MAX_ORDER_AMOUNT) so mulDiv is safe.
+        // QGM-33: price ≤ MAX_ORDER_PRICE (1e18) and fillAmount ≤ MAX_ORDER_AMOUNT (2^128) are
+        // ENFORCED as a soft-skip in _processFillInternal, so this product ≤ 2^128 and mulDiv
+        // cannot overflow/revert on this soft-fail path.
         ctx.fillValue = Math.mulDiv(ctx.executionPrice, fill.fillAmount, 1e18, Math.Rounding.Ceil);
         ctx.outcomeIndex = fill.makerOrder.outcomeIndex;
         ctx.makerHash = makerHash;
@@ -715,9 +746,8 @@ contract ExchangeCLOB is
     /// @dev MERGE: cross-outcome SELL+SELL → mergePositions
     function _executeMerge(Fill calldata fill, FillCtx memory ctx, BatchAcc memory acc) internal returns (string memory) {
         uint256 cps = _getCollateralPerSet(ctx.marketId);
-        // QGM-33 fix: bounded price-sum using _checkedAdd. Inputs already bounded by
-        // MAX_ORDER_PRICE in _processFillInternal so this never reverts in practice,
-        // but the explicit guard preserves soft-fail semantics if bounds are ever relaxed.
+        // QGM-33: both prices ≤ MAX_ORDER_PRICE (1e18), ENFORCED in _processFillInternal, so the
+        // sum ≤ 2e18 and _checkedAdd cannot revert here on the soft-fail path (defense in depth).
         uint256 priceSum = _checkedAdd(fill.makerOrder.price, fill.takerOrder.price);
         if (priceSum > cps) return "pao";
 
@@ -913,22 +943,34 @@ contract ExchangeCLOB is
         }
     }
 
-    /// @dev QGM-52 fix: strictly canonical and NEVER-reverting receiver probe.
-    ///      Requires (1) staticcall success and (2) an EXACT 32-byte payload, then accepts
-    ///      only the canonical boolean `true` (the word == 1). It decodes as `uint256`
-    ///      rather than `bool` on purpose: `abi.decode(_, (bool))` raises Panic(0x21) on a
-    ///      non-canonical bool payload (e.g. a returned `2`), which — in the complementary
-    ///      path that treats this as a soft "bri" skip — would otherwise revert the whole
-    ///      settleBatch instead of skipping the single fill. Any deviation (revert,
-    ///      short/long payload, non-canonical bool) yields `false` without reverting.
+    /// @dev QGM-52 follow-up: strictly canonical, gas-capped, NEVER-reverting receiver probe with
+    ///      bounded return-data handling. The staticcall (1) forwards at most RECEIVER_PROBE_GAS so
+    ///      a hostile receiver cannot grief relayer gas, and (2) copies AT MOST 32 bytes of output,
+    ///      so an oversized return payload cannot cause unbounded memory expansion. It then requires
+    ///      success AND an EXACT 32-byte payload (`returndatasize() == 32`) and accepts only the
+    ///      canonical boolean `true` (the word == 1). Any deviation — revert, out-of-gas, short/long
+    ///      payload, or non-canonical value — yields `false` WITHOUT reverting, so on the
+    ///      complementary path the offending fill is a soft "bri" skip rather than a batch abort.
     function _canReceiveERC1155(address account) internal view returns (bool) {
         if (account.code.length == 0) return true;
 
-        (bool success, bytes memory result) = account.staticcall(
-            abi.encodeWithSelector(IERC165.supportsInterface.selector, type(IERC1155Receiver).interfaceId)
+        bytes memory cd = abi.encodeWithSelector(
+            IERC165.supportsInterface.selector, type(IERC1155Receiver).interfaceId
         );
-        if (!success || result.length != 32) return false;
-        return abi.decode(result, (uint256)) == 1;
+        uint256 gasCap = RECEIVER_PROBE_GAS;
+        bool ok;
+        uint256 word;
+        assembly ("memory-safe") {
+            // staticcall(gas, addr, in, insize, out, outsize) — out=scratch(0x00), outsize=0x20.
+            // Only 32 bytes are ever copied into memory regardless of the callee's return size.
+            let s := staticcall(gasCap, account, add(cd, 0x20), mload(cd), 0x00, 0x20)
+            // Require success AND an exact 32-byte payload; anything else leaves ok=false.
+            if and(s, eq(returndatasize(), 0x20)) {
+                ok := 1
+                word := mload(0x00)
+            }
+        }
+        return ok && word == 1; // canonical true only
     }
 
     function _requireERC1155Receiver(address account) internal view {
@@ -1019,12 +1061,22 @@ contract ExchangeCLOB is
         if (err == ECDSA.RecoverError.NoError && recovered == signer) return true;
 
         // EIP-1271 with gas limit (ProxyWallet / AA ~30k, cap at 50k)
+        // QGM-52 follow-up: bounded return-data handling. Copy at most 32 bytes out, require an
+        // exact 32-byte payload, and treat any malformed/oversized/failed/out-of-gas response as
+        // an invalid signature (false) — never revert. Mirrors the ERC-165 probe hardening.
         if (signer.code.length > 0) {
-            (bool success, bytes memory result) = signer.staticcall{gas: SIG_VERIFY_GAS_LIMIT}(
-                abi.encodeCall(IERC1271.isValidSignature, (digest, sig))
-            );
-            return success && result.length >= 32
-                && abi.decode(result, (bytes4)) == IERC1271.isValidSignature.selector;
+            bytes memory cd = abi.encodeCall(IERC1271.isValidSignature, (digest, sig));
+            uint256 gasCap = SIG_VERIFY_GAS_LIMIT;
+            bool sized;
+            bytes32 word;
+            assembly ("memory-safe") {
+                let s := staticcall(gasCap, signer, add(cd, 0x20), mload(cd), 0x00, 0x20)
+                if and(s, eq(returndatasize(), 0x20)) {
+                    sized := 1
+                    word := mload(0x00)
+                }
+            }
+            return sized && bytes4(word) == IERC1271.isValidSignature.selector;
         }
         return false;
     }

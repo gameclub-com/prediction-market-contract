@@ -574,6 +574,10 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         Market storage m = markets[marketId];
         // M-5 v2: Validate market exists
         if (!m.exists) revert MarketNotFound(marketId);
+        // QGM-45 follow-up: mirror addOIByCondition's frozen gate on this second OI-INCREASE
+        // writer for a uniform "no new exposure while frozen" invariant. (Currently has no
+        // in-contract caller post-Option-C migration; defense-in-depth.)
+        if (m.frozen) revert MarketFrozen(marketId);
         // QGM-45 fix: unify the resolved gate across ALL OI mutators (not just the CT
         // split/merge hooks). This RELAYER path must not mutate OI once the market is
         // resolved, so the dispute-window invariant cannot be sidestepped through it.
@@ -715,6 +719,14 @@ contract MarketRegistry is Initializable, AccessControlEnumerableUpgradeable, UU
         if (marketId == 0) return; // condition not registered as a protocol market
         Market storage m = markets[marketId];
         if (!m.exists) return;
+        // QGM-45 follow-up: a frozen-but-unresolved market must accept NO new exposure.
+        // splitPosition() is directly user-callable while CT-side resolution is false and reaches
+        // this hook; checking only m.resolved (below) let a Safety-Council-frozen market still
+        // accumulate currentOI up to maxOpenInterest via direct mints. Gate the OI-INCREASE path
+        // on frozen too. The OI-decrease hook (subtractOIByCondition) is intentionally left
+        // ungated so merges/exits stay possible (freeze = "no new exposure", not a full pause);
+        // no asymmetric drain results because the mint side reverts atomically (no half-state).
+        if (m.frozen) revert MarketFrozen(marketId);
         // QGM-45 fix: previously this silently skipped (`return`) when m.resolved, which let
         // splitPosition mint OI-skipped sets during the registry-resolved / CT-unresolved
         // dispute window while mergePositions still decremented OI — an asymmetric drain.
